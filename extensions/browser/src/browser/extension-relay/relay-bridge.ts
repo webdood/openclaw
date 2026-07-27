@@ -363,23 +363,31 @@ export class ExtensionRelayBridge {
         this.tabs.delete(tabId);
       }
     }
+    const hasAutoAttachClients = [...this.clients].some((client) => client.autoAttach);
     for (const info of tabs) {
       const existing = this.tabs.get(info.tabId);
       if (existing) {
         existing.info = info;
       } else {
         this.tabs.set(info.tabId, { info });
-        // Newly shared tab: expose it to auto-attach clients right away so an
-        // agent mid-session sees tabs the user shares via the toolbar action.
-        if ([...this.clients].some((client) => client.autoAttach)) {
-          void this.ensureTabAttached(info.tabId)
-            .then(({ targetId, sessionId }) => {
-              this.announceAttachedTab(info.tabId, targetId, sessionId, { onlyAutoAttach: true });
-            })
-            .catch((err: unknown) => {
-              log.warn(`auto-attach of shared tab ${info.tabId} failed: ${String(err)}`);
-            });
-        }
+      }
+      // Attach any shared-but-unattached tab whenever auto-attach clients exist.
+      // This covers newly shared tabs AND existing tabs whose chrome.debugger
+      // attachment was lost across an extension socket reconnect (MV3 service
+      // workers restart freely): handleExtensionGone() clears `attached` but
+      // deliberately keeps the tab list, so this resync must re-attach and
+      // re-announce those tabs or the still-connected Playwright client is left
+      // with zero pages and callers start creating new tabs instead of reusing
+      // the shared one.
+      const tab = this.tabs.get(info.tabId);
+      if (hasAutoAttachClients && tab && !tab.attached && !tab.attaching) {
+        void this.ensureTabAttached(info.tabId)
+          .then(({ targetId, sessionId }) => {
+            this.announceAttachedTab(info.tabId, targetId, sessionId, { onlyAutoAttach: true });
+          })
+          .catch((err: unknown) => {
+            log.warn(`auto-attach of shared tab ${info.tabId} failed: ${String(err)}`);
+          });
       }
     }
   }

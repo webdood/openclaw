@@ -90,6 +90,14 @@ export function assignTabAliases(
   migrateReplacements: boolean,
 ): BrowserTab[] {
   const aliases = getTabAliasState(profileState);
+  if (tabs.length === 0) {
+    // An empty snapshot is often transient (extension relay reconnecting, the
+    // debugger detached mid-restart). Wiping alias state here would retire
+    // every friendly tab id (t1, t2, ...) and hand out fresh numbers when the
+    // same targetIds reappear moments later. Keep the aliases; a later
+    // non-empty listing reconciles genuinely stale entries.
+    return [];
+  }
   const liveTargetIds = new Set(tabs.map((tab) => tab.targetId));
   const staleEntries = Object.entries(aliases.byTargetId).filter(
     ([targetId]) => !liveTargetIds.has(targetId),

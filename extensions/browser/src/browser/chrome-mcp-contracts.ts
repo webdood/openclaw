@@ -161,7 +161,14 @@ export type ChromeMcpProcessCleanupState =
   | { status: "closed" };
 
 export const DEFAULT_CHROME_MCP_COMMAND = "npx";
-export const DEFAULT_CHROME_MCP_PACKAGE_ARGS = ["-y", "chrome-devtools-mcp@latest"];
+// --prefer-offline lets npx resolve the "latest" dist-tag from cached registry
+// metadata instead of a network round-trip on every spawn (crash-respawn bursts
+// were observed re-fetching the registry several times within seconds).
+export const DEFAULT_CHROME_MCP_PACKAGE_ARGS = [
+  "-y",
+  "--prefer-offline",
+  "chrome-devtools-mcp@latest",
+];
 export const DEFAULT_CHROME_MCP_FEATURE_ARGS = [
   "--no-usage-statistics",
   // Direct chrome-devtools-mcp launches do not enable structuredContent by default.

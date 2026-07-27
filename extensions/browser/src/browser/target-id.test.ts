@@ -1,7 +1,7 @@
 // Browser tests cover target id plugin behavior.
 import { describe, expect, it } from "vitest";
 import type { ProfileRuntimeState } from "./server-context.types.js";
-import { assignTabAlias, resolveTargetIdFromTabs } from "./target-id.js";
+import { assignTabAlias, assignTabAliases, resolveTargetIdFromTabs } from "./target-id.js";
 
 const tabs = [
   {
@@ -32,6 +32,26 @@ describe("assignTabAlias", () => {
       }),
     ).toThrow(/tab label/i);
     expect(profileState.tabAliases).toBeUndefined();
+  });
+});
+
+describe("assignTabAliases", () => {
+  it("keeps alias identity across a transient empty listing", () => {
+    const profileState: ProfileRuntimeState = {
+      profile: {} as ProfileRuntimeState["profile"],
+      running: null,
+    };
+    const tab = { targetId: "TARGET-A", title: "", url: "https://example.com", type: "page" };
+
+    const [first] = assignTabAliases(profileState, [tab], true);
+    expect(first?.tabId).toBe("t1");
+
+    // Transient empty snapshot (e.g. extension relay reconnecting after an MV3
+    // service worker restart) must not retire the friendly ids.
+    expect(assignTabAliases(profileState, [], true)).toEqual([]);
+
+    const [again] = assignTabAliases(profileState, [tab], true);
+    expect(again?.tabId).toBe("t1");
   });
 });
 
