@@ -241,11 +241,6 @@ export const en: TranslationMap = {
       channelSchemaUnavailable: "Channel config schema unavailable.",
       loadingSchema: "Loading config schema…",
     },
-    health: {
-      title: "Channel health",
-      subtitle: "Channel status snapshots from the gateway.",
-      noSnapshotYet: "No snapshot yet.",
-    },
     generic: {
       subtitle: "Channel status and configuration.",
     },
@@ -579,6 +574,11 @@ export const en: TranslationMap = {
     createOutcomeUnknown:
       "The Gateway changed while this thread was starting. Check recent threads before starting this task again.",
     catalogUnavailable: "This thread target is unavailable.",
+  },
+  dashboardsPage: {
+    emptyTitle: "No dashboards yet",
+    emptyDescription: "Open a thread and switch to the Dashboard face to add it here.",
+    loadError: "Could not load dashboards: {error}",
   },
   sessionsView: {
     deletePreservedWorktrees:
@@ -946,6 +946,8 @@ export const en: TranslationMap = {
       notCreatedYet: "Not Created Yet",
       updatedUnknown: "Updated Unknown",
       missingHint: "This file is missing. Saving will create it in the agent workspace.",
+      addFile: "Add file…",
+      createHint: "This file does not exist yet. Saving will create it in the agent workspace.",
       content: "Content",
       words: "{count} words",
       lines: "lines",
@@ -1798,6 +1800,7 @@ export const en: TranslationMap = {
     skillWorkshop: "Skill Workshop",
     nodes: "Devices",
     chat: "Chat",
+    dashboards: "Dashboards",
     custodian: "OpenClaw",
     config: "Config",
     profile: "Profile",
@@ -1835,6 +1838,7 @@ export const en: TranslationMap = {
     skillWorkshop: "Review, refine, and apply proposals before they become live skills.",
     nodes: "Paired devices, pairing approvals, and exec bindings.",
     chat: "Gateway chat for quick interventions.",
+    dashboards: "Threads that open on their dashboard face.",
     custodian: "System setup and care.",
     config: "Model defaults, language, and gateway host.",
     profile: "Your agent's stats, streaks, and life in the reef.",
