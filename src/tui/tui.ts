@@ -84,6 +84,7 @@ import type {
   TuiStateAccess,
 } from "./tui-types.js";
 import { buildWaitingStatusMessage, defaultWaitingPhrases } from "./tui-waiting.js";
+import { syncTuiWindowTitleForSelectedSession } from "./tui-window-title.js";
 
 export { resolveFinalAssistantText } from "./tui-formatters.js";
 export type { TuiOptions } from "./tui-types.js";
@@ -1649,6 +1650,7 @@ export async function runTui(opts: RunTuiOptions): Promise<TuiResult> {
       handleAgentEvent(evt.payload);
     }
     if (evt.event === "sessions.changed") {
+      syncTuiWindowTitleForSelectedSession(state, evt.payload);
       handleSessionsChangedEvent(evt.payload);
     }
     if (evt.event === "session.message") {

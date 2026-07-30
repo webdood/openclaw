@@ -5,6 +5,9 @@
 // that into an OSC 0 write so the terminal's title frame - and therefore the
 // taskbar/tab entry - tracks the session name.
 
+import { matchesSelectedTuiSession } from "./tui-session-events.js";
+import type { SessionChangedEvent, TuiStateAccess } from "./tui-types.js";
+
 const TITLE_MAX_LENGTH = 256;
 const BASE_TITLE = "OpenClaw";
 
@@ -95,6 +98,42 @@ export function setTuiWindowTitle(label?: string | null): boolean {
   writeWindowTitle(title);
   lastWrittenTitle = title;
   return true;
+}
+
+/**
+ * Apply a `sessions.changed` payload's label to the window title.
+ *
+ * An absent `label` means the gateway resolved no session row, so it carries no
+ * information about the name and must not reset the title. An explicit `null`
+ * means the label was cleared and should fall back to the base title.
+ */
+export function syncTuiWindowTitleFromSessionEvent(event: { label?: string | null }): boolean {
+  if (event.label === undefined) {
+    return false;
+  }
+  return setTuiWindowTitle(event.label);
+}
+
+/**
+ * Retitle the window when a `sessions.changed` payload targets the session the
+ * TUI is currently showing.
+ *
+ * `/name` can arrive on any event phase, and a rename of some *other* session
+ * must not steal this window's title, so the selected-session check is applied
+ * here rather than at the dispatch site.
+ */
+export function syncTuiWindowTitleForSelectedSession(
+  state: TuiStateAccess,
+  payload: unknown,
+): boolean {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+  const event = payload as SessionChangedEvent;
+  if (!matchesSelectedTuiSession(state, event)) {
+    return false;
+  }
+  return syncTuiWindowTitleFromSessionEvent(event);
 }
 
 /** Test seam: forget the cached title so the next set always writes. */

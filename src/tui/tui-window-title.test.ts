@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TuiStateAccess } from "./tui-types.js";
 import {
   formatTuiWindowTitle,
   resetTuiWindowTitleCacheForTests,
   setTuiWindowTitle,
+  syncTuiWindowTitleForSelectedSession,
+  syncTuiWindowTitleFromSessionEvent,
 } from "./tui-window-title.js";
 
 const ESC = String.fromCharCode(0x1b);
@@ -88,5 +91,61 @@ describe("setTuiWindowTitle", () => {
     process.stdout.isTTY = false;
     expect(setTuiWindowTitle("foo")).toBe(false);
     expect(writes).toHaveLength(0);
+  });
+
+  describe("syncTuiWindowTitleFromSessionEvent", () => {
+    it("retitles from an event label", () => {
+      expect(syncTuiWindowTitleFromSessionEvent({ label: "foo" })).toBe(true);
+      expect(writes).toEqual([`${ESC}]0;OpenClaw - foo${BEL}`]);
+    });
+
+    it("ignores an absent label so an unrelated event cannot reset the title", () => {
+      setTuiWindowTitle("foo");
+      writes.length = 0;
+      expect(syncTuiWindowTitleFromSessionEvent({})).toBe(false);
+      expect(writes).toHaveLength(0);
+    });
+
+    it("treats an explicit null as a cleared label", () => {
+      setTuiWindowTitle("foo");
+      writes.length = 0;
+      expect(syncTuiWindowTitleFromSessionEvent({ label: null })).toBe(true);
+      expect(writes).toEqual([`${ESC}]0;OpenClaw${BEL}`]);
+    });
+  });
+
+  describe("syncTuiWindowTitleForSelectedSession", () => {
+    const state = {
+      currentSessionKey: "agent:main:telegram:direct:7271991700",
+      currentAgentId: "main",
+      agentDefaultId: "main",
+      currentSessionId: null,
+    } as unknown as TuiStateAccess;
+
+    it("retitles for the selected session", () => {
+      expect(
+        syncTuiWindowTitleForSelectedSession(state, {
+          sessionKey: "agent:main:telegram:direct:7271991700",
+          label: "foo",
+        }),
+      ).toBe(true);
+      expect(writes).toEqual([`${ESC}]0;OpenClaw - foo${BEL}`]);
+    });
+
+    it("ignores a rename of a different session", () => {
+      expect(
+        syncTuiWindowTitleForSelectedSession(state, {
+          sessionKey: "agent:main:whatsapp:direct:+16502005044",
+          label: "someone else",
+        }),
+      ).toBe(false);
+      expect(writes).toHaveLength(0);
+    });
+
+    it("ignores payloads that are not objects", () => {
+      expect(syncTuiWindowTitleForSelectedSession(state, undefined)).toBe(false);
+      expect(syncTuiWindowTitleForSelectedSession(state, "nope")).toBe(false);
+      expect(writes).toHaveLength(0);
+    });
   });
 });
