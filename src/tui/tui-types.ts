@@ -66,6 +66,12 @@ export type SessionChangedEvent = {
   clientRunId?: string;
   sessionId?: string;
   updatedAt?: number | null;
+  /**
+   * Session name set by `/name`. The gateway sends `null` for a cleared label
+   * and omits the field entirely when no session row was resolved, so absent
+   * and null mean different things to consumers.
+   */
+  label?: string | null;
 };
 
 export type SessionMessageEvent = {

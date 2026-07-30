@@ -36,6 +36,7 @@ import type {
   TuiHistoryLoadResult,
   TuiStateAccess,
 } from "./tui-types.js";
+import { setTuiWindowTitle } from "./tui-window-title.js";
 
 type EventHandlerChatLog = {
   addLiveUser: (text: string, options: { messageId: string; runId?: string }) => void;
@@ -398,6 +399,13 @@ export function createEventHandlers(context: EventHandlerContext) {
     syncSessionKey();
     if (!matchesSelectedTuiSession(state, evt)) {
       return;
+    }
+
+    // Keep the terminal's title frame on the session name. This runs before the
+    // phase-specific early returns below because `/name` can land on any phase,
+    // and setTuiWindowTitle no-ops when the title is already correct.
+    if (evt.label !== undefined) {
+      setTuiWindowTitle(evt.label);
     }
 
     if (evt.phase === "message") {
