@@ -126,6 +126,41 @@ describe("ExtensionRelayBridge", () => {
     expect(typeof params.sessionId).toBe("string");
   });
 
+  it("re-attaches shared tabs for connected clients after the extension reconnects", async () => {
+    const bridge = new ExtensionRelayBridge();
+    const first = wireExtension(bridge);
+    sendHello(first.handlers);
+
+    const client = new FakeSocket();
+    const cdp = bridge.attachCdpClientSocket(client);
+    cdp.onMessage(
+      JSON.stringify({ id: 1, method: "Target.setAutoAttach", params: { autoAttach: true } }),
+    );
+    await flush();
+    expect(client.frames().filter((f) => f.method === "Target.attachedToTarget")).toHaveLength(1);
+
+    // MV3 service worker restart: a new extension socket replaces the old one
+    // and re-sends hello with the same shared tabs.
+    const second = wireExtension(bridge);
+    sendHello(second.handlers);
+    await flush();
+
+    // The still-connected auto-attach client must be told the old session is
+    // gone and given a fresh attachment for the same shared tab, or it is left
+    // with zero pages and callers create new tabs instead of reusing this one.
+    expect(
+      client.frames().filter((f) => f.method === "Target.detachedFromTarget").length,
+    ).toBeGreaterThanOrEqual(1);
+    const attachedAfter = client.frames().filter((f) => f.method === "Target.attachedToTarget");
+    expect(attachedAfter).toHaveLength(2);
+    const params = attachedAfter[1]?.params as {
+      targetInfo?: { targetId?: string };
+      sessionId?: string;
+    };
+    expect(params.targetInfo?.targetId).toBe("target-1");
+    expect(typeof params.sessionId).toBe("string");
+  });
+
   it("routes session-scoped CDP commands to the owning tab", async () => {
     const bridge = new ExtensionRelayBridge();
     const { socket: extSocket, handlers } = wireExtension(bridge);

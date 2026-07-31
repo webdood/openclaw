@@ -158,6 +158,31 @@ async function focusWindowForTab(tab) {
   }
 }
 
+/**
+ * chrome.tabs.create without a windowId targets the "current window"; from a
+ * service worker there may be none (all Chrome windows unfocused or closed)
+ * and Chrome rejects with "No current window". Fall back to the last focused
+ * normal window, then to opening a fresh window.
+ */
+async function createTabWithWindowFallback(createProperties) {
+  try {
+    return await chrome.tabs.create(createProperties);
+  } catch (err) {
+    const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+    if (win && typeof win.id === "number") {
+      return await chrome.tabs.create({ ...createProperties, windowId: win.id });
+    }
+    const created = await chrome.windows
+      .create({ url: createProperties.url, focused: createProperties.active === true })
+      .catch(() => null);
+    const tab = created && Array.isArray(created.tabs) ? created.tabs[0] : null;
+    if (!tab) {
+      throw err;
+    }
+    return tab;
+  }
+}
+
 async function removeTabFromOpenClawGroup(tabId) {
   try {
     await chrome.tabs.ungroup([tabId]);
@@ -385,7 +410,10 @@ async function handleRelayCommand(msg) {
         return;
       }
       case "createTab": {
-        const tab = await chrome.tabs.create({ url: msg.url, active: msg.background !== true });
+        const tab = await createTabWithWindowFallback({
+          url: msg.url,
+          active: msg.background !== true,
+        });
         await addTabToOpenClawGroup(tab.id);
         if (msg.focus === true) {
           await focusWindowForTab(tab);
