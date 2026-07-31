@@ -1,5 +1,17 @@
-/** Host callback used to read an already-authorized outbound media file. */
-export type OutboundMediaReadFile = (filePath: string) => Promise<Buffer>;
+/** Optional source limit for readers that can reject before buffering. */
+type OutboundMediaReadOptions = {
+  maxBytes: number;
+};
+
+/**
+ * Host callback used to read an already-authorized outbound media file.
+ * Existing one-argument readers remain compatible; readers that consume options
+ * must enforce maxBytes before buffering.
+ */
+export type OutboundMediaReadFile = (
+  filePath: string,
+  options?: OutboundMediaReadOptions,
+) => Promise<Buffer>;
 
 /** Host-provided file access used when a runtime can read outbound media from local disk. */
 export type OutboundMediaAccess = {
@@ -28,7 +40,7 @@ type OutboundMediaLoadParams = {
 type OutboundMediaLoadOptions = {
   maxBytes?: number;
   localRoots?: readonly string[] | "any";
-  readFile?: (filePath: string) => Promise<Buffer>;
+  readFile?: OutboundMediaReadFile;
   proxyUrl?: string;
   fetchImpl?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   requestInit?: RequestInit;

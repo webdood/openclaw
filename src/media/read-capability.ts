@@ -76,9 +76,14 @@ function createAgentScopedHostMediaReadFile(
     params.workspaceDir ??
     (params.agentId ? resolveAgentWorkspaceDir(params.cfg, params.agentId) : undefined);
   const workspaceRoot = resolveWorkspaceRoot(inferredWorkspaceDir);
-  return async (filePath: string) => {
+  return async (filePath, options) => {
     const resolvedPath = resolvePathFromInput(filePath, workspaceRoot);
-    return (await readLocalFileSafely({ filePath: resolvedPath })).buffer;
+    return (
+      await readLocalFileSafely({
+        filePath: resolvedPath,
+        maxBytes: options?.maxBytes,
+      })
+    ).buffer;
   };
 }
 

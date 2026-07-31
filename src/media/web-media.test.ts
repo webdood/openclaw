@@ -3,9 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { expectDefined } from "@openclaw/normalization-core";
 import JSZip from "jszip";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSolidPngBuffer } from "../../test/helpers/image-fixtures.js";
 import { resolveStateDir } from "../config/paths.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
@@ -82,6 +83,10 @@ afterAll(async () => {
   } finally {
     vi.resetModules();
   }
+});
+
+afterEach(() => {
+  __setFsSafeTestHooksForTest(undefined);
 });
 
 describe("loadWebMedia", () => {
@@ -571,6 +576,49 @@ describe("loadWebMedia", () => {
     });
     expect(result.kind).toBe("image");
     expect(result.buffer.length).toBeGreaterThan(0);
+  });
+
+  it("rejects oversized local media before an unbounded file-handle read", async () => {
+    const maxBytes = 1024 * 1024;
+    const oversizedFile = path.join(fixtureRoot, "oversized.bin");
+    await fs.writeFile(oversizedFile, Buffer.alloc(maxBytes + 1));
+    let unboundedReadCalled = false;
+    __setFsSafeTestHooksForTest({
+      afterOpen: (filePath, handle) => {
+        if (filePath !== oversizedFile) {
+          return;
+        }
+        vi.spyOn(handle, "readFile").mockImplementation(async () => {
+          unboundedReadCalled = true;
+          throw new Error("unbounded read invoked");
+        });
+      },
+    });
+
+    await expect(
+      loadWebMediaRaw(oversizedFile, {
+        maxBytes,
+        localRoots: [fixtureRoot],
+      }),
+    ).rejects.toThrow("Media exceeds 1MB limit");
+    expect(unboundedReadCalled).toBe(false);
+  });
+
+  it("passes the source cap to custom local readers before they buffer", async () => {
+    const maxBytes = 1024 * 1024;
+    const readFile = vi.fn(async (_filePath: string, options?: { maxBytes: number }) => {
+      expect(options).toStrictEqual({ maxBytes });
+      throw new Error("custom reader rejected oversized media");
+    });
+
+    await expect(
+      loadWebMediaRaw("/sandbox/oversized.bin", {
+        maxBytes,
+        sandboxValidated: true,
+        readFile,
+      }),
+    ).rejects.toThrow("custom reader rejected oversized media");
+    expect(readFile).toHaveBeenCalledOnce();
   });
 
   it("does not treat image-named generic container bytes as local image media", async () => {

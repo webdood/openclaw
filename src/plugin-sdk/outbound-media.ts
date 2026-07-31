@@ -1,6 +1,10 @@
 // Outbound media helpers normalize plugin media attachments before channel delivery.
 import { randomBytes } from "node:crypto";
-import { buildOutboundMediaLoadOptions, type OutboundMediaAccess } from "../media/load-options.js";
+import {
+  buildOutboundMediaLoadOptions,
+  type OutboundMediaAccess,
+  type OutboundMediaReadFile,
+} from "../media/load-options.js";
 import type { PluginStateKeyedStore } from "./plugin-state-runtime.js";
 import { loadWebMedia } from "./web-media.js";
 
@@ -12,8 +16,8 @@ export type OutboundMediaLoadOptions = {
   mediaAccess?: OutboundMediaAccess;
   /** Approved local roots for file/path media; `"any"` disables root restriction. */
   mediaLocalRoots?: readonly string[] | "any";
-  /** Optional local file reader used by tests or plugin-specific filesystem adapters. */
-  mediaReadFile?: (filePath: string) => Promise<Buffer>;
+  /** Optional reader; bounded adapters consume the second argument's source limit. */
+  mediaReadFile?: OutboundMediaReadFile;
   /** Workspace root used when resolving relative local media paths. */
   workspaceDir?: string;
   /** Explicit proxy URL forwarded to shared outbound media loading policy. */

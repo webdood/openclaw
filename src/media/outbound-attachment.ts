@@ -1,6 +1,10 @@
 // Outbound attachment helpers prepare media attachments for channel delivery.
 import { rm } from "node:fs/promises";
-import { buildOutboundMediaLoadOptions, type OutboundMediaAccess } from "./load-options.js";
+import {
+  buildOutboundMediaLoadOptions,
+  type OutboundMediaAccess,
+  type OutboundMediaReadFile,
+} from "./load-options.js";
 import { saveMediaBuffer } from "./store.js";
 import { loadWebMedia, markTrustedGeneratedHtmlPath } from "./web-media.js";
 
@@ -11,7 +15,7 @@ export async function resolveOutboundAttachmentFromUrl(
   options?: {
     mediaAccess?: OutboundMediaAccess;
     localRoots?: readonly string[];
-    readFile?: (filePath: string) => Promise<Buffer>;
+    readFile?: OutboundMediaReadFile;
   },
 ): Promise<{ path: string; contentType?: string }> {
   const media = await loadWebMedia(

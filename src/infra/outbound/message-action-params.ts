@@ -460,9 +460,10 @@ function buildAttachmentMediaLoadOptions(params: {
   if (params.policy.mode === "sandbox") {
     const sandboxRoot = params.policy.sandboxRoot.trim();
     let sandboxFsPromise: ReturnType<typeof root> | undefined;
-    const readSandboxFile = async (filePath: string): Promise<Buffer> => {
+    const readSandboxFile: OutboundMediaReadFile = async (filePath, options) => {
       sandboxFsPromise ??= root(sandboxRoot);
-      return await (await sandboxFsPromise).readBytes(filePath);
+      const sandboxFs = await sandboxFsPromise;
+      return await sandboxFs.readBytes(filePath, { maxBytes: options?.maxBytes });
     };
     return {
       maxBytes: params.maxBytes,
