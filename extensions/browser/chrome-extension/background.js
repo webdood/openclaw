@@ -168,9 +168,7 @@ async function createTabWithWindowFallback(createProperties) {
   try {
     return await chrome.tabs.create(createProperties);
   } catch (err) {
-    const win = await chrome.windows
-      .getLastFocused({ windowTypes: ["normal"] })
-      .catch(() => null);
+    const win = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
     if (win && typeof win.id === "number") {
       return await chrome.tabs.create({ ...createProperties, windowId: win.id });
     }

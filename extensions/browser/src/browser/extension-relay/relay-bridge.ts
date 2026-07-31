@@ -365,11 +365,12 @@ export class ExtensionRelayBridge {
     }
     const hasAutoAttachClients = [...this.clients].some((client) => client.autoAttach);
     for (const info of tabs) {
-      const existing = this.tabs.get(info.tabId);
-      if (existing) {
-        existing.info = info;
+      let tab = this.tabs.get(info.tabId);
+      if (tab) {
+        tab.info = info;
       } else {
-        this.tabs.set(info.tabId, { info });
+        tab = { info };
+        this.tabs.set(info.tabId, tab);
       }
       // Attach any shared-but-unattached tab whenever auto-attach clients exist.
       // This covers newly shared tabs AND existing tabs whose chrome.debugger
@@ -379,8 +380,7 @@ export class ExtensionRelayBridge {
       // re-announce those tabs or the still-connected Playwright client is left
       // with zero pages and callers start creating new tabs instead of reusing
       // the shared one.
-      const tab = this.tabs.get(info.tabId);
-      if (hasAutoAttachClients && tab && !tab.attached && !tab.attaching) {
+      if (hasAutoAttachClients && !tab.attached && !tab.attaching) {
         void this.ensureTabAttached(info.tabId)
           .then(({ targetId, sessionId }) => {
             this.announceAttachedTab(info.tabId, targetId, sessionId, { onlyAutoAttach: true });
