@@ -24,7 +24,7 @@ import {
   MEMORY_INDEX_META_TABLE,
   MEMORY_INDEX_SOURCES_TABLE,
   type MemoryProviderStatus,
-} from "../memory-host-sdk/engine-storage.js";
+} from "../memory-host-sdk/status-storage.js";
 import { defaultSlotIdForKey } from "../plugins/slots.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import { createLazyImportLoader } from "../shared/lazy-promise.js";

@@ -57,6 +57,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- **Lean status startup:** keep default JSON status and plugin inventory paths off optional memory and mutable plugin-runtime barrels, reducing CLI startup memory on constrained systems.
 - **Local media memory bounds:** reject oversized local media in owned readers before buffering it, preventing low-memory OOM failures while preserving the larger source allowance used for image optimization.
 - **Control UI dynamic deep links:** reuse the initial route loader result when publishing real agent, session, dashboard, Workboard, Memory, and Plugins paths, avoiding redundant route-loader work during startup. Thanks @shakkernerd.
 - **Linux gateway service ownership:** refuse user-scope systemd publication and activation when the same gateway unit name is already owned or cannot be verified in the system scope, including `--force`, with actionable recovery guidance instead of creating restart-looping dual managers. Fixes #116129.
