@@ -1,9 +1,14 @@
 import type { WorkboardCard } from "@openclaw/workboard-contract";
 // Workboard plugin module implements tools behavior.
 import { jsonResult, readStringParam } from "openclaw/plugin-sdk/core";
-import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import type {
+  AnyAgentTool,
+  OpenClawPluginApi,
+  OpenClawPluginToolContext,
+} from "openclaw/plugin-sdk/plugin-entry";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
+import { asNonArrayRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { Type } from "typebox";
 import { redactClaimToken } from "./card-redaction.js";
 import { WorkboardStore } from "./store.js";
@@ -979,10 +984,7 @@ export function createWorkboardTools(params: {
         { additionalProperties: false },
       ),
       execute: async (_toolCallId, rawParams) => {
-        const record =
-          rawParams && typeof rawParams === "object" && !Array.isArray(rawParams)
-            ? (rawParams as Record<string, unknown>)
-            : {};
+        const record = asNonArrayRecord(rawParams);
         const result = await store.dispatch({ boardId: record.boardId });
         return jsonResult({
           ...result,
@@ -1035,4 +1037,3 @@ export function createWorkboardTools(params: {
     },
   ];
 }
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

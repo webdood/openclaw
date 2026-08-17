@@ -22,7 +22,7 @@ import { inferLineTargetChatType, normalizeLineMessagingTarget } from "./messagi
 import { lineMessageAdapter, lineOutboundAdapter } from "./outbound.js";
 import { hasLineDirectives, parseLineDirectives } from "./reply-payload-transform.js";
 import { getLineRuntime } from "./runtime.js";
-import { lineSetupAdapter, lineSetupContract } from "./setup-core.js";
+import { lineSetupContract } from "./setup-core.js";
 import { lineSetupWizard } from "./setup-surface.js";
 import { lineStatusAdapter } from "./status.js";
 
@@ -38,6 +38,7 @@ const lineSecurityAdapter = createRestrictSendersChannelSecurity<ResolvedLineAcc
   groupPolicyPath: "channels.line.groupPolicy",
   groupAllowFromPath: "channels.line.groupAllowFrom",
   mentionGated: false,
+  findingTitle: "LINE security warning",
   policyPathSuffix: "dmPolicy",
   approveHint: "openclaw pairing approve line <code>",
   normalizeDmEntry: (raw) => raw.replace(/^line:(?:user:)?/i, ""),
@@ -114,7 +115,6 @@ export const linePlugin: ChannelPlugin<ResolvedLineAccount> = createChatChannelP
       },
     },
     directory: createEmptyChannelDirectoryAdapter(),
-    setup: lineSetupAdapter,
     setupContract: lineSetupContract,
     status: lineStatusAdapter,
     gateway: lineGatewayAdapter,

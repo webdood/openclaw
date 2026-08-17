@@ -10,9 +10,10 @@ import {
   McpError,
   type CallToolResult,
   type ClientCapabilities,
+  type ServerCapabilities,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { ServerCapabilities } from "@modelcontextprotocol/sdk/types.js";
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { SessionToolOverrides } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -21,7 +22,6 @@ import { redactToolPayloadText } from "../logging/redact.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import { runTasksWithConcurrency } from "../utils/run-with-concurrency.js";
 import { mergeMcpToolCatalogs } from "./agent-bundle-mcp-combined.js";
-import { matchesMcpToolFilterPattern } from "./agent-bundle-mcp-filter.js";
 import {
   completeDeferredSessionMcpRuntimeRetirement,
   disposeAllSessionMcpRuntimes,
@@ -39,6 +39,7 @@ import {
   setDefaultCreateSessionMcpRuntime,
 } from "./agent-bundle-mcp-manager.js";
 import { assignSafeServerNames, sanitizeServerName } from "./agent-bundle-mcp-names.js";
+import { getSessionMcpRequestSignal } from "./agent-bundle-mcp-request-context.js";
 import {
   loadSessionMcpConfig,
   resolveSessionMcpConfigSummary,
@@ -50,18 +51,24 @@ import type {
   McpServerCatalog,
   McpToolCatalog,
   McpToolCatalogDiagnostic,
+  RequesterMcpConnect,
   SessionMcpRequesterScope,
   SessionMcpRuntime,
   SessionMcpRuntimeManager,
 } from "./agent-bundle-mcp-types.js";
-import { isMcpConfigRecord } from "./mcp-config-shared.js";
+import {
+  normalizeMcpCodexToolAnnotations,
+  resolveMcpCodexToolApprovalMode,
+} from "./mcp-codex-tool-approval.js";
 import {
   applyMcpConnectionOverride,
   type McpServerConnectionResolved,
 } from "./mcp-connection-resolver.js";
 import { createMcpJsonSchemaValidator } from "./mcp-json-schema-validator.js";
 import { sanitizeMcpMetadataText } from "./mcp-metadata.js";
+import { collectMcpPaginatedItems } from "./mcp-pagination.js";
 import { OpenClawStdioClientTransport } from "./mcp-stdio-transport.js";
+import { isMcpToolAllowed, normalizeMcpToolFilter } from "./mcp-tool-filter.js";
 import { resolveMcpTransport } from "./mcp-transport.js";
 
 type BundleMcpSession = {
@@ -89,6 +96,9 @@ const BUNDLE_MCP_CATALOG_FAILURE_RETRY_MS = 5_000;
 const BUNDLE_MCP_CATALOG_LIST_TIMEOUT_MS = 1_500;
 const BUNDLE_MCP_DISPOSE_TIMEOUT_MS = 5_000;
 const BUNDLE_MCP_CATALOG_CONNECT_CONCURRENCY = 6;
+const BUNDLE_MCP_MAX_LIST_PAGES = 128;
+const BUNDLE_MCP_MAX_LIST_ITEMS = 16_384;
+const BUNDLE_MCP_MAX_LIST_BYTES = 10 * 1024 * 1024;
 let bundleMcpCatalogListTimeoutMs: number | undefined;
 const BUNDLE_MCP_TEST_STATE_KEY = Symbol.for("openclaw.bundleMcpTestState");
 type BundleMcpTestState = { disposeTimeoutMs?: number };
@@ -103,11 +113,6 @@ function getBundleMcpTestState(): BundleMcpTestState {
   globalStore[BUNDLE_MCP_TEST_STATE_KEY] = state;
   return state;
 }
-
-type McpToolSelection = {
-  include?: readonly string[];
-  exclude?: readonly string[];
-};
 
 type McpServerBackoffState = {
   session: BundleMcpSession;
@@ -145,7 +150,7 @@ async function connectWithTimeout(
       }),
     ]);
   } catch (error) {
-    if (deadlineExpired || (isMcpConfigRecord(error) && error.code === ErrorCode.RequestTimeout)) {
+    if (deadlineExpired || (isRecord(error) && error.code === ErrorCode.RequestTimeout)) {
       if (transport instanceof OpenClawStdioClientTransport) {
         await transport.forceClose();
       }
@@ -160,9 +165,7 @@ async function connectWithTimeout(
     }
     throw error;
   } finally {
-    if (timeout) {
-      clearTimeout(timeout);
-    }
+    clearTimeout(timeout);
   }
 }
 
@@ -170,20 +173,38 @@ function redactMcpDiagnosticError(error: unknown): string {
   return redactToolPayloadText(redactSensitiveUrlLikeString(String(error)));
 }
 
-async function listAllTools(client: Client, timeoutMs: number) {
-  const tools: ListedTool[] = [];
-  let cursor: string | undefined;
-  do {
-    const params = cursor ? { cursor } : undefined;
-    const page = await client.listTools(params, { timeout: timeoutMs });
-    tools.push(...page.tools);
-    cursor = page.nextCursor;
-  } while (cursor);
-  return tools;
+async function listAllTools(client: Client, timeoutMs: number, signal: AbortSignal) {
+  return await collectMcpPaginatedItems({
+    label: "MCP tool listing",
+    itemLabel: "tools",
+    timeoutMs,
+    maxPages: BUNDLE_MCP_MAX_LIST_PAGES,
+    maxItems: BUNDLE_MCP_MAX_LIST_ITEMS,
+    maxBytes: BUNDLE_MCP_MAX_LIST_BYTES,
+    signal,
+    loadPage: async ({ cursor, requestTimeoutMs, signal: requestSignal }) => {
+      const requestController = new AbortController();
+      const onAbort = () => requestController.abort(requestSignal.reason);
+      requestSignal.addEventListener("abort", onAbort, { once: true });
+      if (requestSignal.aborted) {
+        onAbort();
+      }
+      try {
+        const page = await client.listTools(cursor === undefined ? undefined : { cursor }, {
+          timeout: requestTimeoutMs,
+          maxTotalTimeout: requestTimeoutMs,
+          signal: requestController.signal,
+        });
+        return { items: page.tools, nextCursor: page.nextCursor, serializedValue: page };
+      } finally {
+        requestSignal.removeEventListener("abort", onAbort);
+      }
+    },
+  });
 }
 
 function isMcpMethodNotFoundError(error: unknown): boolean {
-  if (isMcpConfigRecord(error) && error.code === ErrorCode.MethodNotFound) {
+  if (isRecord(error) && error.code === ErrorCode.MethodNotFound) {
     return true;
   }
   const message = String(error);
@@ -193,10 +214,11 @@ function isMcpMethodNotFoundError(error: unknown): boolean {
 async function listAllToolsBestEffort(params: {
   client: Client;
   timeoutMs: number;
+  signal: AbortSignal;
   suppressUnsupported: boolean;
 }): Promise<ListedTool[]> {
   try {
-    return await listAllTools(params.client, params.timeoutMs);
+    return await listAllTools(params.client, params.timeoutMs, params.signal);
   } catch (error) {
     if (params.suppressUnsupported && isMcpMethodNotFoundError(error)) {
       return [];
@@ -258,40 +280,6 @@ function buildMcpClientOptions(mcpAppsEnabled: boolean): ClientOptions {
   return { capabilities: buildMcpClientCapabilities(mcpAppsEnabled) };
 }
 
-async function listAllResources(
-  loadPage: (cursor: string | undefined) => ReturnType<Client["listResources"]>,
-) {
-  const resources: unknown[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await loadPage(cursor);
-    resources.push(...page.resources);
-    cursor = page.nextCursor;
-  } while (cursor);
-  return resources;
-}
-
-async function listAllPrompts(
-  loadPage: (cursor: string | undefined) => ReturnType<Client["listPrompts"]>,
-) {
-  const prompts: unknown[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await loadPage(cursor);
-    prompts.push(...page.prompts);
-    cursor = page.nextCursor;
-  } while (cursor);
-  return prompts;
-}
-
-function normalizeStringList(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const entries = value.filter((entry): entry is string => typeof entry === "string");
-  return entries.length > 0 ? entries : undefined;
-}
-
 function normalizeToolUiVisibility(value: unknown): Array<"app" | "model"> | undefined {
   if (!Array.isArray(value)) {
     return undefined;
@@ -300,28 +288,6 @@ function normalizeToolUiVisibility(value: unknown): Array<"app" | "model"> | und
     (entry): entry is "app" | "model" => entry === "app" || entry === "model",
   );
   return [...new Set(normalized)].toSorted();
-}
-
-function getMcpToolSelection(rawServer: unknown): McpToolSelection {
-  if (!isMcpConfigRecord(rawServer) || !isMcpConfigRecord(rawServer.toolFilter)) {
-    return {};
-  }
-  return {
-    include: normalizeStringList(rawServer.toolFilter.include),
-    exclude: normalizeStringList(rawServer.toolFilter.exclude),
-  };
-}
-
-function shouldExposeMcpTool(selection: McpToolSelection, toolName: string): boolean {
-  const include = selection.include ?? [];
-  const exclude = selection.exclude ?? [];
-  if (
-    include.length > 0 &&
-    !include.some((pattern) => matchesMcpToolFilterPattern(pattern, toolName))
-  ) {
-    return false;
-  }
-  return !exclude.some((pattern) => matchesMcpToolFilterPattern(pattern, toolName));
 }
 
 function summarizeServerCapabilities(capabilities: ServerCapabilities | undefined) {
@@ -406,6 +372,7 @@ export function createSessionMcpRuntime(params: {
   connectionOverrides?: ReadonlyMap<string, McpServerConnectionResolved>;
   redactConnectionServerNames?: ReadonlySet<string>;
   requesterScope?: SessionMcpRequesterScope;
+  requesterConnect?: RequesterMcpConnect;
   configFingerprint?: string;
   toolOverrides?: Pick<SessionToolOverrides, "mcpServers" | "mcpToolsDeny">;
 }): SessionMcpRuntime {
@@ -426,6 +393,7 @@ export function createSessionMcpRuntime(params: {
   let lastUsedAt = createdAt;
   let activeLeases = 0;
   let disposed = false;
+  const lifecycleAbortController = new AbortController();
   let catalog: McpToolCatalog | null = null;
   let catalogRetryAfterMs: number | undefined;
   let catalogInFlight: Promise<McpToolCatalog> | undefined;
@@ -548,8 +516,16 @@ export function createSessionMcpRuntime(params: {
   const runMcpRequest = async <T>(
     session: BundleMcpSession,
     request: (signal: AbortSignal) => Promise<T>,
+    parentSignal?: AbortSignal,
   ): Promise<T> => {
+    const requestSignal = parentSignal ?? getSessionMcpRequestSignal();
     const abortController = new AbortController();
+    const onParentAbort = () => abortController.abort(requestSignal?.reason);
+    if (requestSignal?.aborted) {
+      onParentAbort();
+    } else {
+      requestSignal?.addEventListener("abort", onParentAbort, { once: true });
+    }
     const timeoutError = new McpError(ErrorCode.RequestTimeout, "Request timed out", {
       timeout: session.requestTimeoutMs,
     });
@@ -559,8 +535,16 @@ export function createSessionMcpRuntime(params: {
     }, session.requestTimeoutMs);
     timeout.unref?.();
     try {
-      return await request(abortController.signal);
+      const signal = abortController.signal;
+      signal.throwIfAborted();
+      const result = await request(signal);
+      requestSignal?.throwIfAborted();
+      return result;
+    } catch (error) {
+      requestSignal?.throwIfAborted();
+      throw error;
     } finally {
+      requestSignal?.removeEventListener("abort", onParentAbort);
       clearTimeout(timeout);
     }
   };
@@ -570,6 +554,7 @@ export function createSessionMcpRuntime(params: {
     request: () => Promise<T>,
     options?: McpRequestOptions,
   ): Promise<T> => {
+    const requestSignal = getSessionMcpRequestSignal();
     const tracksFailureBackoff = options?.failureBackoff !== "ignore";
     const nowMs = Date.now();
     const backoff = serverBackoff.get(serverName);
@@ -602,9 +587,9 @@ export function createSessionMcpRuntime(params: {
         error instanceof StreamableHTTPError &&
         error.code === 404;
       let recycleReason: "expired HTTP session" | "repeated request timeouts" | undefined;
-      if (sessionExpired) {
+      if (sessionExpired && !requestSignal?.aborted) {
         recycleReason = "expired HTTP session";
-      } else if (tracksFailureBackoff) {
+      } else if (tracksFailureBackoff && !requestSignal?.aborted) {
         const failures = recordServerToolFailure(serverName, session, nowMs);
         const requestTimedOut =
           error !== null && typeof error === "object" && localRequestTimeouts.has(error);
@@ -627,6 +612,41 @@ export function createSessionMcpRuntime(params: {
       }
       throw error;
     }
+  };
+  const runGuardedMcpRequest = <T>(
+    serverName: string,
+    session: BundleMcpSession,
+    request: (signal: AbortSignal) => Promise<T>,
+    options?: McpRequestOptions,
+  ) => runGuardedServerRequest(serverName, session, () => runMcpRequest(session, request), options);
+  const collectServerItems = (session: BundleMcpSession, kind: "prompts" | "resources") => {
+    const callerSignal = getSessionMcpRequestSignal();
+    return collectMcpPaginatedItems({
+      label: `MCP ${kind === "resources" ? "resource" : "prompt"} listing`,
+      itemLabel: kind,
+      timeoutMs: session.requestTimeoutMs,
+      maxPages: BUNDLE_MCP_MAX_LIST_PAGES,
+      maxItems: BUNDLE_MCP_MAX_LIST_ITEMS,
+      maxBytes: BUNDLE_MCP_MAX_LIST_BYTES,
+      signal: callerSignal
+        ? AbortSignal.any([lifecycleAbortController.signal, callerSignal])
+        : lifecycleAbortController.signal,
+      loadPage: ({ cursor, requestTimeoutMs: timeout, signal }) =>
+        runMcpRequest(
+          session,
+          async (requestSignal) => {
+            const requestParams = cursor === undefined ? undefined : { cursor };
+            const requestOptions = { timeout, maxTotalTimeout: timeout, signal: requestSignal };
+            const page =
+              kind === "resources"
+                ? await session.client.listResources(requestParams, requestOptions)
+                : await session.client.listPrompts(requestParams, requestOptions);
+            const items = page[kind] as unknown[];
+            return { items, nextCursor: page.nextCursor, serializedValue: page };
+          },
+          signal,
+        ),
+    });
   };
 
   const loadCatalog = async (retryBaseCatalog?: McpToolCatalog): Promise<McpToolCatalog> => {
@@ -688,9 +708,14 @@ export function createSessionMcpRuntime(params: {
           const transportSource = override
             ? applyMcpConnectionOverride(rawServer, override)
             : rawServer;
+          const dataDirOwnership = Object.hasOwn(loaded.prepareDataDirsByServer ?? {}, serverName)
+            ? loaded.prepareDataDirsByServer?.[serverName]
+            : undefined;
           const resolved = resolveMcpTransport(serverName, transportSource, {
             cfg: params.cfg,
             agentDir: params.agentDir,
+            prepareDataDir: dataDirOwnership?.dataDir,
+            requesterScope: params.requesterScope,
           });
           if (!resolved) {
             continue;
@@ -825,18 +850,21 @@ export function createSessionMcpRuntime(params: {
                 const listedTools = await listAllToolsBestEffort({
                   client: session.client,
                   timeoutMs: getCatalogListTimeoutMs(rawServer, resolved.requestTimeoutMs),
+                  signal: lifecycleAbortController.signal,
                   suppressUnsupported: Boolean(
                     !capabilities.tools && (capabilities.resources || capabilities.prompts),
                   ),
                 });
                 failIfDisposed();
-                const selection = getMcpToolSelection(rawServer);
+                const toolFilter = normalizeMcpToolFilter(
+                  isRecord(rawServer) ? rawServer.toolFilter : undefined,
+                );
                 const denialMap = params.toolOverrides?.mcpToolsDeny;
                 const deniedToolNames = new Set(
                   denialMap && Object.hasOwn(denialMap, serverName) ? denialMap[serverName] : [],
                 );
                 const policyEligibleTools = listedTools.filter((tool) =>
-                  shouldExposeMcpTool(selection, tool.name.trim()),
+                  isMcpToolAllowed(toolFilter, tool.name.trim()),
                 );
                 const exposedTools = policyEligibleTools.filter((tool) => {
                   const toolName = tool.name.trim();
@@ -861,17 +889,11 @@ export function createSessionMcpRuntime(params: {
                         },
                       }
                     : {}),
-                  ...(selection.include || selection.exclude
-                    ? {
-                        toolFilter: {
-                          ...(selection.include ? { include: [...selection.include] } : {}),
-                          ...(selection.exclude ? { exclude: [...selection.exclude] } : {}),
-                        },
-                      }
-                    : {}),
+                  ...(toolFilter ? { toolFilter } : {}),
                   ...(deniedToolNames.size > 0
                     ? { deniedToolNames: [...deniedToolNames].toSorted() }
                     : {}),
+                  codexApprovalMode: resolveMcpCodexToolApprovalMode(serverName, rawServer),
                 };
                 const toolEntries: McpCatalogTool[] = [];
                 for (const tool of policyEligibleTools) {
@@ -901,6 +923,7 @@ export function createSessionMcpRuntime(params: {
                     ...(uiResourceUri ? { uiResourceUri } : {}),
                     ...(uiVisibility ? { uiVisibility } : {}),
                     ...(deniedToolNames.has(toolName) ? { deniedBySession: true } : {}),
+                    codexAnnotations: normalizeMcpCodexToolAnnotations(tool.annotations),
                   });
                 }
                 return {
@@ -1032,14 +1055,19 @@ export function createSessionMcpRuntime(params: {
     });
     return staleCatalog;
   };
+  const getActiveSession = async (serverName: string) => {
+    await getCatalog();
+    return requireConnectedSession(serverName);
+  };
 
-  return {
+  const runtime: SessionMcpRuntime = {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
     workspaceDir: params.workspaceDir,
     agentDir: params.agentDir,
     configFingerprint,
     ...(params.requesterScope ? { requesterScope: params.requesterScope } : {}),
+    ...(params.requesterConnect ? { requesterConnect: params.requesterConnect } : {}),
     // A runtime partition hosts either only static or only requester-scoped servers.
     isRequesterScopedServer: () => params.requesterScope !== undefined,
     mcpAppsEnabled,
@@ -1067,110 +1095,69 @@ export function createSessionMcpRuntime(params: {
     peekCatalog() {
       return catalog;
     },
+    /** Session-owned timeout that survives catalog invalidation. */
+    getServerRequestTimeoutMs(serverName: string) {
+      return sessions.get(serverName)?.requestTimeoutMs;
+    },
     markUsed() {
       lastUsedAt = Date.now();
     },
     async callTool(serverName, toolName, input) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
-      return await runGuardedServerRequest(
-        serverName,
-        session,
-        async () =>
-          (await runMcpRequest(session, async (signal) =>
-            session.client.callTool(
-              {
-                name: toolName,
-                arguments: isMcpConfigRecord(input) ? input : {},
-              },
-              undefined,
-              { timeout: session.requestTimeoutMs, signal },
-            ),
-          )) as CallToolResult,
-      );
+      const session = await getActiveSession(serverName);
+      return (await runGuardedMcpRequest(serverName, session, (signal) =>
+        session.client.callTool(
+          { name: toolName, arguments: isRecord(input) ? input : {} },
+          undefined,
+          { timeout: session.requestTimeoutMs, signal },
+        ),
+      )) as CallToolResult;
     },
     async listTools(serverName, requestParams) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
-      return await runGuardedServerRequest(serverName, session, async () =>
-        runMcpRequest(session, async (signal) =>
-          session.client.listTools(requestParams, { timeout: session.requestTimeoutMs, signal }),
-        ),
+      const session = await getActiveSession(serverName);
+      return await runGuardedMcpRequest(serverName, session, (signal) =>
+        session.client.listTools(requestParams, { timeout: session.requestTimeoutMs, signal }),
       );
     },
     async listResources(serverName, options) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
+      const session = await getActiveSession(serverName);
       return await runGuardedServerRequest(
         serverName,
         session,
-        async () =>
-          listAllResources((cursor) =>
-            runMcpRequest(session, async (signal) =>
-              session.client.listResources(cursor ? { cursor } : undefined, {
-                timeout: session.requestTimeoutMs,
-                signal,
-              }),
-            ),
-          ),
+        async () => collectServerItems(session, "resources"),
         options,
       );
     },
     async readResource(serverName, uri, options) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
-      return await runGuardedServerRequest(
+      const session = await getActiveSession(serverName);
+      return await runGuardedMcpRequest(
         serverName,
         session,
-        async () =>
-          runMcpRequest(session, async (signal) =>
-            session.client.readResource({ uri }, { timeout: session.requestTimeoutMs, signal }),
-          ),
+        (signal) =>
+          session.client.readResource({ uri }, { timeout: session.requestTimeoutMs, signal }),
         options,
       );
     },
     async listResourceTemplates(serverName, requestParams) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
-      return await runGuardedServerRequest(serverName, session, async () =>
-        runMcpRequest(session, async (signal) =>
-          session.client.listResourceTemplates(requestParams, {
-            timeout: session.requestTimeoutMs,
-            signal,
-          }),
-        ),
+      const session = await getActiveSession(serverName);
+      return await runGuardedMcpRequest(serverName, session, (signal) =>
+        session.client.listResourceTemplates(requestParams, {
+          timeout: session.requestTimeoutMs,
+          signal,
+        }),
       );
     },
     async listPrompts(serverName) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
+      const session = await getActiveSession(serverName);
       return await runGuardedServerRequest(serverName, session, async () =>
-        listAllPrompts((cursor) =>
-          runMcpRequest(session, async (signal) =>
-            session.client.listPrompts(cursor ? { cursor } : undefined, {
-              timeout: session.requestTimeoutMs,
-              signal,
-            }),
-          ),
-        ),
+        collectServerItems(session, "prompts"),
       );
     },
     async getPrompt(serverName, name, args) {
-      failIfDisposed();
-      await getCatalog();
-      const session = requireConnectedSession(serverName);
-      return await runGuardedServerRequest(serverName, session, async () =>
-        runMcpRequest(session, async (signal) =>
-          session.client.getPrompt(
-            { name, ...(args ? { arguments: args } : {}) },
-            { timeout: session.requestTimeoutMs, signal },
-          ),
+      const session = await getActiveSession(serverName);
+      return await runGuardedMcpRequest(serverName, session, (signal) =>
+        session.client.getPrompt(
+          { name, ...(args ? { arguments: args } : {}) },
+          { timeout: session.requestTimeoutMs, signal },
         ),
       );
     },
@@ -1179,6 +1166,7 @@ export function createSessionMcpRuntime(params: {
         return;
       }
       disposed = true;
+      lifecycleAbortController.abort(createDisposedError(params.sessionId));
       catalog = null;
       catalogRetryAfterMs = undefined;
       catalogInFlight = undefined;
@@ -1187,6 +1175,7 @@ export function createSessionMcpRuntime(params: {
       await Promise.allSettled(sessionsToClose.map((session) => disposeSession(session)));
     },
   };
+  return runtime;
 }
 
 setDefaultCreateSessionMcpRuntime(createSessionMcpRuntime);

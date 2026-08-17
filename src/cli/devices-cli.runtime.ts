@@ -1,4 +1,5 @@
 // Device pairing runtime commands for gateway and loopback-local fallback operations.
+import { coerceErrorMessage as normalizeErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -6,21 +7,13 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import {
-  GATEWAY_CLIENT_MODES,
-  GATEWAY_CLIENT_NAMES,
-} from "../../packages/gateway-protocol/src/client-info.js";
-import {
   readConnectPairingRequiredMessage,
   type ConnectPairingRequiredDetails,
 } from "../../packages/gateway-protocol/src/connect-error-details.js";
 import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import { getTerminalTableWidth, renderTable } from "../../packages/terminal-core/src/table.js";
 import { theme } from "../../packages/terminal-core/src/theme.js";
-import {
-  buildGatewayConnectionDetails,
-  callGateway,
-  formatGatewayTransportErrorJson,
-} from "../gateway/call.js";
+import { buildGatewayConnectionDetails, formatGatewayTransportErrorJson } from "../gateway/call.js";
 import {
   ADMIN_SCOPE,
   PAIRING_SCOPE,
@@ -31,8 +24,10 @@ import { isLoopbackHost } from "../gateway/net.js";
 import {
   approveDevicePairing,
   formatDevicePairingForbiddenMessage,
+} from "../infra/device-pairing-approval.js";
+import { summarizeDeviceTokens } from "../infra/device-pairing-tokens.js";
+import {
   listDevicePairing,
-  summarizeDeviceTokens,
   type PairedDevice as InfraPairedDevice,
 } from "../infra/device-pairing.js";
 import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
@@ -46,8 +41,7 @@ import {
 import { parseNodeList } from "../shared/node-list-parse.js";
 import type { NodeListNode } from "../shared/node-list-types.js";
 import { formatCliCommand } from "./command-format.js";
-import { parseTimeoutMsWithFallback } from "./parse-timeout.js";
-import { withProgress } from "./progress.js";
+import { callGatewayFromCliWithTransport } from "./gateway-rpc.js";
 import { quoteCliArg } from "./quote-cli-arg.js";
 
 type DevicesRpcOpts = {
@@ -137,25 +131,11 @@ const callGatewayCli = async (
   params?: unknown,
   callOpts?: { scopes?: OperatorScope[] },
 ) =>
-  withProgress(
-    {
-      label: `Devices ${method}`,
-      indeterminate: true,
-      enabled: opts.json !== true,
-    },
-    async () =>
-      await callGateway({
-        url: opts.url,
-        token: opts.token,
-        password: opts.password,
-        method,
-        params,
-        timeoutMs: parseTimeoutMsWithFallback(opts.timeout, DEFAULT_DEVICES_TIMEOUT_MS),
-        clientName: GATEWAY_CLIENT_NAMES.CLI,
-        mode: GATEWAY_CLIENT_MODES.CLI,
-        scopes: callOpts?.scopes,
-      }),
-  );
+  callGatewayFromCliWithTransport(method, opts, params, {
+    label: `Devices ${method}`,
+    defaultTimeoutMs: DEFAULT_DEVICES_TIMEOUT_MS,
+    scopes: callOpts?.scopes,
+  });
 
 function isPendingNodeApprovalState(
   state: unknown,
@@ -298,13 +278,6 @@ async function findQueryPendingNodeApprovalNotices(
   );
 }
 
-function normalizeErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
-}
-
 function isDevicePairingApprovalDenied(error: unknown): boolean {
   return normalizeLowercaseStringOrEmpty(normalizeErrorMessage(error)).includes(
     "device pairing approval denied",
@@ -359,16 +332,28 @@ function resolveLocalPairingFallback(
   }
 }
 
-function buildFallbackStateMismatchError(details: ConnectPairingRequiredDetails): Error {
-  return new Error(
-    [
-      details.requestId
-        ? `${FALLBACK_STATE_MISMATCH_MESSAGE} Missing requestId: ${details.requestId}.`
-        : FALLBACK_STATE_MISMATCH_MESSAGE,
-      "The running gateway is probably using a different OPENCLAW_PROFILE or OPENCLAW_STATE_DIR than this CLI.",
-      "Rerun with the same profile/state-dir as the gateway, or pass --token/--password so the CLI can approve through the gateway.",
-    ].join("\n"),
-  );
+function buildFallbackStateMismatchError(
+  details: ConnectPairingRequiredDetails,
+  pendingRequestIds: string[],
+): Error {
+  const heading = details.requestId
+    ? `${FALLBACK_STATE_MISMATCH_MESSAGE} Missing requestId: ${details.requestId}.`
+    : FALLBACK_STATE_MISMATCH_MESSAGE;
+  // A populated local pending list means the CLI and gateway share this store:
+  // each rejected connect re-mints the request, so the held id is stale rather
+  // than foreign. Only an empty list suggests a genuinely different store, and
+  // shared-auth flags are only a fix when the gateway actually uses shared auth.
+  const guidance =
+    pendingRequestIds.length > 0
+      ? [
+          "That request was superseded by a newer pending request.",
+          `Approve the current request instead: openclaw devices approve ${pendingRequestIds[0]}`,
+        ]
+      : [
+          "The running gateway may be using a different OPENCLAW_PROFILE or OPENCLAW_STATE_DIR than this CLI.",
+          "Rerun with the gateway's profile/state-dir; if the gateway uses shared auth, pass --token/--password to approve through it.",
+        ];
+  return new Error([heading, ...guidance].join("\n"));
 }
 
 function assertLocalFallbackMatchesGatewayRequest(
@@ -379,25 +364,27 @@ function assertLocalFallbackMatchesGatewayRequest(
   if (!requestId) {
     return;
   }
-  const hasRequest = (list.pending ?? []).some(
-    (request) => normalizeOptionalString(request.requestId) === requestId,
-  );
-  if (!hasRequest) {
-    throw buildFallbackStateMismatchError(details);
+  const pendingRequestIds = (list.pending ?? [])
+    .map((request) => normalizeOptionalString(request.requestId))
+    .filter((id): id is string => Boolean(id));
+  if (!pendingRequestIds.includes(requestId)) {
+    throw buildFallbackStateMismatchError(details, pendingRequestIds);
   }
 }
 
 function redactLocalPairedDevice(device: InfraPairedDevice): PairedDevice {
   const { tokens, ...rest } = device;
   return {
-    ...(rest as unknown as PairedDevice),
-    tokens: summarizeDeviceTokens(tokens) as DeviceTokenSummary[] | undefined,
+    ...rest,
+    tokens: summarizeDeviceTokens(tokens),
   };
 }
 
 async function listPairingWithFallback(opts: DevicesRpcOpts): Promise<DevicePairingList> {
   try {
-    return parseDevicePairingList(await callGatewayCli("device.pair.list", opts, {}));
+    return parseDevicePairingList(
+      await callGatewayCli("device.pair.list", opts, {}, { scopes: [PAIRING_SCOPE] }),
+    );
   } catch (error) {
     const fallback = resolveLocalPairingFallback(opts, error);
     if (!fallback) {
@@ -500,7 +487,9 @@ async function approvePairingWithFallback(
       if (!hasOriginalPending && !hasGatewayPending) {
         return null;
       }
-      throw buildFallbackStateMismatchError(fallback.details);
+      // Fail-closed replacement validation refused to substitute; do not point
+      // at the incompatible pending id as a recovery step.
+      throw buildFallbackStateMismatchError(fallback.details, []);
     }
     const approved = await approveDevicePairing(requestId, {
       // Local CLI fallback already assumes direct machine access; treat it as an
@@ -509,7 +498,7 @@ async function approvePairingWithFallback(
     });
     if (!approved) {
       if (gatewayRequestId && gatewayRequestId === requestId) {
-        throw buildFallbackStateMismatchError(fallback.details);
+        throw buildFallbackStateMismatchError(fallback.details, []);
       }
       return null;
     }
@@ -971,6 +960,30 @@ export async function runDevicesListCommand(opts: DevicesRpcOpts): Promise<void>
   }
 }
 
+export async function runDevicesJoinCodeCommand(opts: DevicesRpcOpts): Promise<void> {
+  const result = await callGatewayCli(
+    "device.pair.setupCode",
+    opts,
+    {
+      bootstrapProfile: "node",
+      includeQr: false,
+      joinUrl: true,
+    },
+    { scopes: [ADMIN_SCOPE] },
+  );
+  const joinUrl = normalizeOptionalString((result as { joinUrl?: unknown }).joinUrl);
+  if (!joinUrl) {
+    throw new Error("Gateway did not return a device join URL.");
+  }
+  const command = `npx openclaw connect ${quoteCliArg(joinUrl)}`;
+  if (opts.json) {
+    defaultRuntime.writeJson({ joinUrl, command });
+    return;
+  }
+  defaultRuntime.log(joinUrl);
+  defaultRuntime.log(command);
+}
+
 export async function runDevicesRemoveCommand(
   deviceId: string,
   opts: DevicesRpcOpts,
@@ -1163,7 +1176,17 @@ export async function runDevicesRejectCommand(
   requestId: string,
   opts: DevicesRpcOpts,
 ): Promise<void> {
-  const result = await callGatewayCli("device.pair.reject", opts, { requestId });
+  const normalizedRequestId = normalizeOptionalString(requestId);
+  if (!normalizedRequestId) {
+    defaultRuntime.error(
+      `requestId is required. Run ${formatCliCommand("openclaw devices list")} to choose a pending request.`,
+    );
+    defaultRuntime.exit(1);
+    return;
+  }
+  const result = await callGatewayCli("device.pair.reject", opts, {
+    requestId: normalizedRequestId,
+  });
   if (opts.json) {
     defaultRuntime.writeJson(result);
     return;

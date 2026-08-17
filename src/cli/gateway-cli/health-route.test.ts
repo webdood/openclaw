@@ -37,7 +37,12 @@ describe("runGatewayHealthJsonRoute", () => {
       },
     );
 
-    expect(callGateway).toHaveBeenCalledWith("health", { json: true, timeout: "10000" });
+    expect(callGateway).toHaveBeenCalledWith(
+      "health",
+      { json: true, timeout: "10000" },
+      undefined,
+      { defaultTimeoutMs: 10_000 },
+    );
     expect(runtime.writeJson).toHaveBeenCalledWith({ ok: true, durationMs: 6 }, 2);
     expect(readBestEffortConfig).not.toHaveBeenCalled();
     expect(emitReachableGatewayAuthDiagnostic).not.toHaveBeenCalled();
@@ -70,10 +75,12 @@ describe("runGatewayHealthJsonRoute", () => {
           gateway: { auth: { mode: "token" }, mode: "local", port: 19083 },
         },
       }),
+      undefined,
+      { defaultTimeoutMs: 10_000 },
     );
   });
 
-  it("preserves the existing error contract when local config resolution fails", async () => {
+  it("formats local config resolution failures", async () => {
     const runtime = createRuntime();
     const error = new Error("config unavailable");
     const callGateway = vi.fn();
@@ -94,7 +101,7 @@ describe("runGatewayHealthJsonRoute", () => {
 
     expect(callGateway).not.toHaveBeenCalled();
     expect(runtime.writeJson).not.toHaveBeenCalled();
-    expect(runtime.error).toHaveBeenCalledWith(String(error));
+    expect(runtime.error).toHaveBeenCalledWith(error.message);
     expect(runtime.exit).toHaveBeenCalledWith(1);
   });
 

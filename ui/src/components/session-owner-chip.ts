@@ -2,6 +2,7 @@ import { html, nothing } from "lit";
 import { property } from "lit/decorators.js";
 import type { SessionCreatedActor as ProtocolSessionCreatedActor } from "../../../packages/gateway-protocol/src/schema/sessions.js";
 import { t } from "../i18n/index.ts";
+import { takeGraphemes } from "../lib/graphemes.ts";
 import { resolveAvatar } from "../lib/identity-avatar.ts";
 import { OpenClawLightDomElement } from "../lit/openclaw-element.ts";
 import "./viewer-facepile.ts";
@@ -47,12 +48,14 @@ export function renderSessionOwnerChip(
   createdActor: SessionCreatedActor | null | undefined,
   size: "row" | "header",
   attribution: "created" | "archived" = "created",
+  viewingNow?: boolean,
 ) {
   return createdActor?.id
     ? html`<openclaw-session-owner-chip
         .createdActor=${createdActor}
         size=${size}
         attribution=${attribution}
+        .viewingNow=${viewingNow}
       ></openclaw-session-owner-chip>`
     : nothing;
 }
@@ -66,8 +69,11 @@ function ownerInitials(createdActor: SessionCreatedActor): string {
     .replace(/@.*$/u, "")
     .split(/[\s._-]+/u)
     .filter(Boolean);
-  const initials = ((parts[0]?.[0] ?? "") + (parts[1]?.[0] ?? "")).toUpperCase();
-  return initials || source[0]!.toUpperCase();
+  // Grapheme clusters, not UTF-16 units or bare code points: emoji display names
+  // must render their complete visible initial (no lone surrogates or split ZWJ sequences).
+  const firstChar = (value: string | undefined): string => (value ? takeGraphemes(value, 1) : "");
+  const initials = (firstChar(parts[0]) + firstChar(parts[1])).toUpperCase();
+  return initials || firstChar(source).toUpperCase();
 }
 
 // Deterministic hue per identity so a person keeps one color everywhere.
@@ -80,18 +86,17 @@ function ownerHue(id: string): number {
 }
 
 /**
- * Permanent session-owner avatar. Ownership is provenance, not presence:
- * this chip is solid and never pulses/expires, in deliberate contrast to the
- * translucent, ring-styled live-presence chips. Render only when the gateway
- * has 2+ distinct creator identities (solo mode shows no attribution chrome).
- * Human actors use only the durable profile projection carried by the session
- * record. Actors without that source keep stable initials because provenance
- * outlives live connection presence.
+ * Permanent session-owner avatar. Ownership is provenance, so the chip remains
+ * when its owner leaves; live viewing only changes avatar saturation. Render
+ * only when the gateway has 2+ distinct creator identities (solo mode shows no
+ * attribution chrome). Human actors use the durable profile projection carried
+ * by the session record; actors without it keep stable initials.
  */
 class SessionOwnerChip extends OpenClawLightDomElement {
   @property({ attribute: false }) createdActor: SessionCreatedActor | null = null;
   @property({ type: String }) size: "row" | "header" = "row";
   @property({ type: String }) attribution: "created" | "archived" = "created";
+  @property({ attribute: false }) viewingNow?: boolean;
 
   override render() {
     const createdActor = this.createdActor;
@@ -103,10 +108,13 @@ class SessionOwnerChip extends OpenClawLightDomElement {
       return nothing;
     }
     const title = createdActor.label || createdActor.id;
-    const accessibleLabel = t(
+    const attributionLabel = t(
       this.attribution === "archived" ? "sessionsView.archivedBy" : "sessionsView.createdBy",
       { name: title },
     );
+    const accessibleLabel = this.viewingNow
+      ? `${attributionLabel} · ${t("sessionsView.viewingNow")}`
+      : attributionLabel;
     const avatar = createdActor.avatarUrl
       ? resolveAvatar({
           id: createdActor.id,
@@ -116,7 +124,9 @@ class SessionOwnerChip extends OpenClawLightDomElement {
       : null;
     return html`
       <span
-        class="session-owner-chip session-owner-chip--${this.size}"
+        class="session-owner-chip session-owner-chip--${this.size} ${this.viewingNow === false
+          ? "session-owner-chip--away"
+          : ""}"
         style="--owner-hue: ${ownerHue(createdActor.id)}"
         role="img"
         aria-label=${accessibleLabel}

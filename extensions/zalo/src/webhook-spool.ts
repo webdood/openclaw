@@ -8,6 +8,7 @@ import {
   type ChannelIngressQueue,
 } from "openclaw/plugin-sdk/channel-outbound";
 import { isRecord } from "openclaw/plugin-sdk/channel-secret-basic-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { normalizeNullableString as nonEmptyString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { runDetachedWebhookWork } from "openclaw/plugin-sdk/webhook-request-guards";
 import { ZaloApiError, type ZaloUpdate } from "./api.js";
@@ -96,8 +97,13 @@ function parseClaimedUpdate(payload: ZaloWebhookSpoolPayload, claimedId: string)
   const message = facts.update.message as Record<string, unknown>;
   const from = isRecord(message.from) ? message.from : null;
   const chat = isRecord(message.chat) ? message.chat : null;
-  if (!nonEmptyString(from?.id)) {
+  const fromId = nonEmptyString(from?.id);
+  if (!from || !fromId) {
     throw new ZaloWebhookPayloadError("Zalo webhook message is missing message.from.id.");
+  }
+  const chatId = nonEmptyString(chat?.id);
+  if (!chatId) {
+    throw new ZaloWebhookPayloadError("Zalo webhook message is missing message.chat.id.");
   }
   if (chat?.chat_type !== "PRIVATE" && chat?.chat_type !== "GROUP") {
     throw new ZaloWebhookPayloadError("Zalo webhook message has an invalid chat type.");
@@ -108,11 +114,29 @@ function parseClaimedUpdate(payload: ZaloWebhookSpoolPayload, claimedId: string)
   if (eventName === "message.text.received" && typeof message.text !== "string") {
     throw new ZaloWebhookPayloadError("Zalo text event is missing message.text.");
   }
-  return facts.update as unknown as ZaloUpdate;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return {
+    event_name: eventName,
+    message: {
+      message_id: claimedId,
+      from: {
+        id: fromId,
+        ...(typeof from.name === "string" ? { name: from.name } : {}),
+        ...(typeof from.display_name === "string" ? { display_name: from.display_name } : {}),
+        ...(typeof from.avatar === "string" ? { avatar: from.avatar } : {}),
+        ...(typeof from.is_bot === "boolean" ? { is_bot: from.is_bot } : {}),
+      },
+      chat: {
+        id: chatId,
+        chat_type: chat.chat_type,
+      },
+      date: message.date,
+      ...(typeof message.text === "string" ? { text: message.text } : {}),
+      ...(typeof message.photo_url === "string" ? { photo_url: message.photo_url } : {}),
+      ...(typeof message.caption === "string" ? { caption: message.caption } : {}),
+      ...(typeof message.sticker === "string" ? { sticker: message.sticker } : {}),
+      ...(typeof message.message_type === "string" ? { message_type: message.message_type } : {}),
+    },
+  };
 }
 
 function isZaloAuthenticationFailure(error: unknown): boolean {
@@ -194,14 +218,15 @@ function createZaloWebhookIngress(options: {
           return { reason: "invalid-event", message: error.message };
         }
         if (isZaloAuthenticationFailure(error)) {
-          return { reason: "authentication-failed", message: errorText(error) };
+          return { reason: "authentication-failed", message: formatErrorMessage(error) };
         }
         return null;
       },
       onLog: (message) => options.runtime.error?.(`zalo ingress: ${message}`),
     },
     createStoppedError: () => new Error("Zalo ingress stopped."),
-    onError: (error) => options.runtime.error?.(`zalo ingress drain failed: ${errorText(error)}`),
+    onError: (error) =>
+      options.runtime.error?.(`zalo ingress drain failed: ${formatErrorMessage(error)}`),
   });
 
   return {

@@ -4,7 +4,6 @@ import {
   createSessionWorkspaceProps,
   openSessionWorkspaceFile,
   renderSessionWorkspaceRail,
-  toggleSessionWorkspace,
   type SessionWorkspaceHost,
 } from "./chat-session-workspace.ts";
 
@@ -17,48 +16,114 @@ function gatewayHello(methods: string[], scopes = ["operator.admin"]) {
   };
 }
 
-describe("toggleSessionWorkspace", () => {
-  it("expands and collapses the session workspace rail", () => {
-    const requestUpdate = vi.fn();
+describe("session workspace state", () => {
+  it("carries the saved bottom dock across session workspace state", () => {
     const state = {
       client: null,
       connected: false,
       handleOpenSidebar: vi.fn(),
       hello: null,
-      requestUpdate,
+      requestUpdate: vi.fn(),
       sessionKey: "agent:main:current",
+      settings: { chatWorkspaceDock: "bottom" },
       sessions: {},
     } as unknown as SessionWorkspaceHost;
 
-    expect(createSessionWorkspaceProps(state).collapsed).toBe(true);
+    const workspace = createSessionWorkspaceProps(state);
+    expect(workspace.dock).toBe("bottom");
 
-    toggleSessionWorkspace(state);
-
-    expect(createSessionWorkspaceProps(state).collapsed).toBe(false);
-
-    toggleSessionWorkspace(state);
-
-    expect(createSessionWorkspaceProps(state).collapsed).toBe(true);
-    expect(requestUpdate).toHaveBeenCalledTimes(2);
+    workspace.onSetDock("right");
+    expect(createSessionWorkspaceProps(state).dock).toBe("right");
+    expect(state.settings?.chatWorkspaceDock).toBe("right");
   });
 });
 
-describe("custodian panel toggle", () => {
-  it("is available only while the gateway is connected and advertises chat", () => {
+describe("session workspace artifacts", () => {
+  function createArtifactHost(params: { data: string; mimeType: string; title?: string }) {
+    const handleOpenSidebar = vi.fn();
+    const request = vi.fn().mockResolvedValue({
+      artifact: {
+        id: "artifact-1",
+        mimeType: params.mimeType,
+        title: params.title ?? "Unicode artifact",
+      },
+      data: params.data,
+      encoding: "base64",
+    });
     const state = {
-      client: null,
-      connected: false,
-      handleOpenSidebar: vi.fn(),
-      hello: gatewayHello(["openclaw.chat"]),
-      requestUpdate: vi.fn(),
+      client: { request },
+      connected: true,
+      handleOpenSidebar,
+      hello: gatewayHello([]),
       sessionKey: "agent:main:current",
       sessions: {},
     } as unknown as SessionWorkspaceHost;
+    return { handleOpenSidebar, request, state };
+  }
 
-    expect(createSessionWorkspaceProps(state).onToggleCustodian).toBeUndefined();
+  it.each([
+    {
+      content: "Résumé 東京 🦀",
+      fence: "```",
+      mimeType: "text/plain",
+    },
+    {
+      content: JSON.stringify({ message: "Résumé 東京 🦀" }),
+      fence: "```json",
+      mimeType: "application/json",
+    },
+  ])(
+    "decodes UTF-8 $mimeType artifacts without corrupting visible or raw text",
+    async (testCase) => {
+      const data = btoa(String.fromCharCode(...new TextEncoder().encode(testCase.content)));
+      const { handleOpenSidebar, state } = createArtifactHost({
+        data,
+        mimeType: testCase.mimeType,
+      });
 
-    state.connected = true;
-    expect(createSessionWorkspaceProps(state).onToggleCustodian).toBeTypeOf("function");
+      createSessionWorkspaceProps(state).onOpenArtifact("artifact-1");
+
+      await vi.waitFor(() => expect(handleOpenSidebar).toHaveBeenCalledOnce());
+      expect(handleOpenSidebar.mock.calls[0]?.[0]).toEqual({
+        kind: "markdown",
+        content: `# Unicode artifact\n\n${testCase.fence}\n${testCase.content}\n\`\`\``,
+        rawText: testCase.content,
+      });
+    },
+  );
+
+  it("preserves inline image artifacts as their original base64 data URLs", async () => {
+    const data = "iVBORw0KGgo=";
+    const { handleOpenSidebar, state } = createArtifactHost({
+      data,
+      mimeType: "image/png",
+      title: "preview.png",
+    });
+
+    createSessionWorkspaceProps(state).onOpenArtifact("artifact-1");
+
+    await vi.waitFor(() => expect(handleOpenSidebar).toHaveBeenCalledOnce());
+    expect(handleOpenSidebar.mock.calls[0]?.[0]).toEqual({
+      kind: "image",
+      mimeType: "image/png",
+      rawText: null,
+      src: `data:image/png;base64,${data}`,
+      title: "preview.png",
+    });
+  });
+
+  it("reports malformed base64 artifact data as a visible workspace error", async () => {
+    const { handleOpenSidebar, state } = createArtifactHost({
+      data: "not-base64!",
+      mimeType: "text/plain",
+    });
+
+    createSessionWorkspaceProps(state).onOpenArtifact("artifact-1");
+
+    await vi.waitFor(() =>
+      expect(createSessionWorkspaceProps(state).error).toMatch(/InvalidCharacterError|invalid/i),
+    );
+    expect(handleOpenSidebar).not.toHaveBeenCalled();
   });
 });
 
@@ -172,16 +237,20 @@ describe("openSessionWorkspaceFile", () => {
         connected: true,
         handleOpenSidebar: vi.fn(),
         hello: gatewayHello([]),
+        agentsList: [],
         sessionKey: "agent:main:current",
         sessions: { getFile, listFiles },
       } as unknown as SessionWorkspaceHost;
 
-      toggleSessionWorkspace(state);
+      createSessionWorkspaceProps(state, { expanded: true });
       await vi.waitFor(() => expect(listFiles).toHaveBeenCalledOnce());
       await vi.waitFor(() => expect(createSessionWorkspaceProps(state).list).not.toBeNull());
 
       const container = document.createElement("div");
-      render(renderSessionWorkspaceRail(createSessionWorkspaceProps(state)), container);
+      render(
+        renderSessionWorkspaceRail(createSessionWorkspaceProps(state, { expanded: true })),
+        container,
+      );
       const row = container.querySelector<HTMLButtonElement>(
         ".chat-workspace-rail__list--browser .chat-workspace-rail__file-open",
       );

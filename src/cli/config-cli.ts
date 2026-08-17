@@ -4,12 +4,13 @@ import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
 import { theme } from "../../packages/terminal-core/src/theme.js";
 import { readConfigFileSnapshot, replaceConfigFile } from "../config/config.js";
 import { formatConfigIssueLines, normalizeConfigIssues } from "../config/issue-format.js";
-import { attachConfigIssueDiagnostics } from "../config/issue-location.js";
+import { renderConfigValidationIssueLines } from "../config/issue-location.js";
 import { CONFIG_PATH, resolveConfigPath } from "../config/paths.js";
 import { redactConfigObject } from "../config/redact-snapshot.js";
 import { readBestEffortRuntimeConfigSchema } from "../config/runtime-schema.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { danger, info, success, warn } from "../globals.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import {
   ExitError,
   type RuntimeEnv,
@@ -182,11 +183,11 @@ export async function runConfigGet(opts: { path: string; json?: boolean; runtime
       throw err;
     }
     if (opts.json) {
-      writeRuntimeJson(runtime, { error: String(err) });
+      writeRuntimeJson(runtime, { error: formatErrorMessage(err) });
       runtime.exit(1);
       return;
     }
-    runtime.error(danger(String(err)));
+    runtime.error(danger(formatErrorMessage(err)));
     runtime.exit(1);
   }
 }
@@ -278,12 +279,17 @@ export async function runConfigUnset(opts: {
   }
 }
 
-async function runConfigFile(opts: { runtime?: RuntimeEnv }) {
+async function runConfigFile(opts: { json?: boolean; runtime?: RuntimeEnv }) {
   const runtime = opts.runtime ?? defaultRuntime;
   try {
-    runtime.log(resolveConfigPath());
+    const path = resolveConfigPath();
+    if (opts.json) {
+      writeRuntimeJson(runtime, { path });
+      return;
+    }
+    writeRuntimeStdout(runtime, `${path}\n`);
   } catch (err) {
-    runtime.error(danger(String(err)));
+    runtime.error(danger(formatErrorMessage(err)));
     runtime.exit(1);
   }
 }
@@ -297,7 +303,7 @@ async function runConfigSchema(opts: { runtime?: RuntimeEnv } = {}) {
     schema.properties = { $schema: { type: "string" }, ...schema.properties };
     writeRuntimeJson(runtime, schema);
   } catch (err) {
-    runtime.error(danger(`Config schema error: ${String(err)}`));
+    runtime.error(danger(`Config schema error: ${formatErrorMessage(err)}`));
     runtime.exit(1);
   }
 }
@@ -326,18 +332,8 @@ async function runConfigValidate(opts: { json?: boolean; runtime?: RuntimeEnv } 
       if (opts.json) {
         writeRuntimeJson(runtime, { valid: false, path: outputPath, issues });
       } else {
-        const displayIssues = attachConfigIssueDiagnostics(issues, {
-          raw: snapshot.raw,
-          parsed: snapshot.parsed,
-          effective: snapshot.sourceConfig,
-          configPath: snapshot.path,
-          formatPathForDisplay: true,
-          includeReceivedValueHint: true,
-        });
         runtime.error(danger(`OpenClaw config is invalid: ${shortPath}`));
-        for (const line of formatConfigIssueLines(displayIssues, danger("×"), {
-          normalizeRoot: true,
-        })) {
+        for (const line of renderConfigValidationIssueLines(snapshot, danger("×"))) {
           runtime.error(`  ${line}`);
         }
         runtime.error("");
@@ -363,9 +359,13 @@ async function runConfigValidate(opts: { json?: boolean; runtime?: RuntimeEnv } 
     }
   } catch (err) {
     if (opts.json) {
-      writeRuntimeJson(runtime, { valid: false, path: outputPath, error: String(err) }, 0);
+      writeRuntimeJson(
+        runtime,
+        { valid: false, path: outputPath, error: formatErrorMessage(err) },
+        0,
+      );
     } else {
-      runtime.error(danger(`Config validation error: ${String(err)}`));
+      runtime.error(danger(`Config validation error: ${formatErrorMessage(err)}`));
     }
     runtime.exit(1);
   }
@@ -430,9 +430,9 @@ export function registerConfigCli(program: Command) {
       false,
     )
     .option("--ref-provider <alias>", "SecretRef builder: provider alias")
-    .option("--ref-source <source>", "SecretRef builder: source (env|file|exec)")
+    .option("--ref-source <source>", "SecretRef builder: source (env|file|exec|store)")
     .option("--ref-id <id>", "SecretRef builder: ref id")
-    .option("--provider-source <source>", "Provider builder: source (env|file|exec)")
+    .option("--provider-source <source>", "Provider builder: source (env|file|exec|store)")
     .option(
       "--provider-allowlist <envVar>",
       "Provider builder (env): allowlist entry (repeatable)",
@@ -470,16 +470,6 @@ export function registerConfigCli(program: Command) {
       "Provider builder (exec): trusted directory (repeatable)",
       collectOption,
       [] as string[],
-    )
-    .option(
-      "--provider-allow-insecure-path",
-      "Provider builder (file|exec): bypass strict path permission checks",
-      false,
-    )
-    .option(
-      "--provider-allow-symlink-command",
-      "Provider builder (exec): allow command symlink path",
-      false,
     )
     .option("--batch-json <json>", "Batch mode: JSON array of set operations")
     .option("--batch-file <path>", "Batch mode: read JSON array of set operations from file")
@@ -524,10 +514,15 @@ export function registerConfigCli(program: Command) {
       await runConfigUnset({ path, cliOptions: options });
     });
 
-  cmd.command("file").description("Print the active config file path").action(runConfigFile);
+  cmd
+    .command("file")
+    .description("Print the active config file path")
+    .option("--json", "Output JSON", false)
+    .action((opts: { json?: boolean }) => runConfigFile(opts));
   cmd
     .command("schema")
     .description("Print the JSON schema for openclaw.json")
+    .option("--json", "Output JSON", false)
     .action(runConfigSchema);
   cmd
     .command("validate")

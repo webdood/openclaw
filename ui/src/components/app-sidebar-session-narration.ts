@@ -1,5 +1,9 @@
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import type { SessionObserverDigest } from "../../../packages/gateway-protocol/src/schema/sessions.js";
+import { Value } from "typebox/value";
+import {
+  SessionObserverDigestSchema,
+  type SessionObserverDigest,
+} from "../../../packages/gateway-protocol/src/schema/sessions.js";
 import {
   INTERNAL_RUNTIME_CONTEXT_BEGIN,
   INTERNAL_RUNTIME_CONTEXT_END,
@@ -90,10 +94,6 @@ function trailingInternalDelimiterPrefix(text: string): string {
   return "";
 }
 
-function rowIsRunning(row: SidebarRecentSession): boolean {
-  return row.hasActiveRun || row.status === "running";
-}
-
 function rowRecency(row: SidebarRecentSession): number {
   return row.startedAt ?? row.updatedAt ?? 0;
 }
@@ -161,7 +161,7 @@ export class SidebarSessionNarrationController {
       .map((row, index) => ({ row, index }))
       .filter(
         ({ row }) =>
-          rowIsRunning(row) && !areUiSessionKeysEquivalent(row.key, input.openSessionKey.trim()),
+          row.hasActiveRun && !areUiSessionKeysEquivalent(row.key, input.openSessionKey.trim()),
       )
       .toSorted(
         (left, right) => rowRecency(right.row) - rowRecency(left.row) || left.index - right.index,
@@ -540,8 +540,11 @@ export class SidebarSessionNarrationController {
     ) {
       return;
     }
+    const digest = { ...record, runId };
+    if (!Value.Check(SessionObserverDigestSchema, digest)) {
+      return;
+    }
     this.observeRun(key, runId);
-    const digest = { ...record, runId } as unknown as SessionObserverDigest;
     const previous = this.observerDigests.get(key);
     if (previous && pickFreshestObserverDigest(previous, digest) === previous) {
       return;
