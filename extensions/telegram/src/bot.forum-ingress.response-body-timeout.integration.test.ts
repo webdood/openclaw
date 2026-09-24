@@ -2,6 +2,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { Bot } from "grammy";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import { getChildLogger } from "openclaw/plugin-sdk/runtime-env";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defaultTelegramBotDeps } from "./bot-deps.js";
@@ -16,10 +17,10 @@ import {
 } from "./bot-handlers.message-pipeline.js";
 import type { RegisterTelegramHandlerParams } from "./bot-handlers.types.js";
 import { telegramBotInfoForTest } from "./bot.create-telegram-bot.test-support.js";
-import { resetTelegramForumFlagCacheForTest } from "./bot/helpers.js";
 import { asTelegramClientFetch, createTelegramClientFetch } from "./client-fetch.js";
 import { createTelegramIngressResolver, createTelegramIngressSubject } from "./ingress.js";
 import * as telegramRequestTimeouts from "./request-timeouts.js";
+import { setTelegramRuntime } from "./runtime.js";
 
 describe("Telegram supergroup ingress with a stalled Bot API response body", () => {
   const liveSockets = new Set<Socket>();
@@ -30,6 +31,7 @@ describe("Telegram supergroup ingress with a stalled Bot API response body", () 
   let resolveGetChatHeaders: (() => void) | undefined;
 
   beforeAll(async () => {
+    setTelegramRuntime(createPluginRuntimeMock());
     server = createServer((request, response) => {
       if (!request.url?.endsWith("/getChat")) {
         response.writeHead(404);
@@ -56,7 +58,6 @@ describe("Telegram supergroup ingress with a stalled Bot API response body", () 
 
   afterAll(async () => {
     vi.restoreAllMocks();
-    resetTelegramForumFlagCacheForTest();
     for (const socket of liveSockets) {
       socket.destroy();
     }
@@ -71,7 +72,6 @@ describe("Telegram supergroup ingress with a stalled Bot API response body", () 
       (method, configuredTimeoutSeconds) =>
         method === "getchat" ? 100 : canonicalRequestTimeout(method, configuredTimeoutSeconds),
     );
-    resetTelegramForumFlagCacheForTest();
 
     const clientFetch = createTelegramClientFetch({
       fetchImpl: asTelegramClientFetch(globalThis.fetch),
@@ -97,7 +97,7 @@ describe("Telegram supergroup ingress with a stalled Bot API response body", () 
       accountId: "default",
       ownerAgentId: "main",
       bot,
-      cfg: {},
+      cfg: { messages: { inbound: { debounceMs: 0 } } },
       mediaMaxBytes: 1,
       opts: { token: "123456:integration-token", botInfo },
       runtime: { error: vi.fn(), exit: vi.fn(), log: vi.fn() },
@@ -130,7 +130,8 @@ describe("Telegram supergroup ingress with a stalled Bot API response body", () 
           }),
         effectiveDmAllow: emptyAllow,
         context: {
-          cfg: {},
+          commandAuthorizedByConfig: false,
+          cfg: params.cfg,
           telegramCfg: {},
           allowFrom: [],
           dmPolicy: "open" as const,

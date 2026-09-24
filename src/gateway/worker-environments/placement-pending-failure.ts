@@ -1,7 +1,7 @@
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import { sessionChanges } from "../../sessions/session-row-changes.js";
 import type { DB as StateDatabase } from "../../state/openclaw-state-db.generated.js";
 import {
-  isCurrentPlacementTurnClaim,
   placementTurnOwner,
   required,
   type WorkerSessionPlacementRecord,
@@ -13,8 +13,12 @@ import {
   assertNoRunningWorkerSessionToolOperations,
   clearWorkerTurnToolState,
 } from "./placement-session-tool-operations.js";
-import { signalWorkerTurnClaimClosed } from "./placement-turn-claims.js";
-import type { WorkerWorkspacePendingResult } from "./placement-workspace-result.js";
+import { publishPlacementTurnClaimState } from "./placement-turn-authority.js";
+import { deferWorkerTurnClaimClosed } from "./placement-turn-claim-events.js";
+import {
+  isCurrentWorkerWorkspacePendingResultOwner,
+  type WorkerWorkspacePendingResult,
+} from "./placement-workspace-result.js";
 import { boundedWorkerError } from "./worker-error.js";
 
 export function createPlacementPendingFailureOps(runtime: PlacementStoreRuntime) {
@@ -26,8 +30,11 @@ export function createPlacementPendingFailureOps(runtime: PlacementStoreRuntime)
     ): WorkerSessionPlacementRecord {
       const sessionId = required(pending.sessionId, "session id");
       const recoveryError = boundedWorkerError(error);
-      const outcome = write((db) => {
+      return write((db) => {
         const current = getRequired(db, sessionId);
+        if (!isCurrentWorkerWorkspacePendingResultOwner(current, pending)) {
+          throw new Error(`Session ${sessionId} workspace result owner changed before failure`);
+        }
         const persisted = current.turnClaim;
         const releasedClaim: WorkerSessionTurnClaim | null = persisted
           ? {
@@ -35,31 +42,9 @@ export function createPlacementPendingFailureOps(runtime: PlacementStoreRuntime)
               claimId: persisted.claimId,
               runId: persisted.runId,
               placementGeneration: persisted.generation,
-              owner: placementTurnOwner({
-                executionMode: current.executionMode,
-                environmentId: pending.environmentId,
-                activeOwnerEpoch: pending.ownerEpoch,
-              }),
+              owner: placementTurnOwner(current),
             }
           : null;
-        const exactClaim =
-          releasedClaim === null ||
-          (releasedClaim.claimId === pending.claimId &&
-            releasedClaim.runId === pending.runId &&
-            releasedClaim.placementGeneration === pending.placementGeneration &&
-            isCurrentPlacementTurnClaim(current, releasedClaim));
-        if (
-          (current.state !== "active" && current.state !== "draining") ||
-          current.environmentId !== pending.environmentId ||
-          current.activeOwnerEpoch !== pending.ownerEpoch ||
-          current.generation !==
-            (current.state === "active"
-              ? pending.placementGeneration
-              : pending.placementGeneration + 1) ||
-          !exactClaim
-        ) {
-          throw new Error(`Session ${sessionId} workspace result owner changed before failure`);
-        }
         const pendingQuery =
           getNodeSqliteKysely<Pick<StateDatabase, "worker_workspace_pending_results">>(db);
         const exactPending = executeSqliteQuerySync(
@@ -101,6 +86,7 @@ export function createPlacementPendingFailureOps(runtime: PlacementStoreRuntime)
             throw new Error(`Session ${sessionId} workspace result changed during drain`);
           }
           transitioning = getRequired(db, sessionId);
+          publishPlacementTurnClaimState(db, transitioning);
         }
         if (transitioning.state !== "draining") {
           throw new Error(`Session ${sessionId} workspace result did not reach draining`);
@@ -126,6 +112,7 @@ export function createPlacementPendingFailureOps(runtime: PlacementStoreRuntime)
           throw new Error(`Session ${sessionId} workspace result changed during reconcile`);
         }
         transitioning = getRequired(db, sessionId);
+        publishPlacementTurnClaimState(db, transitioning);
         const failedValues = transitionValues(
           transitioning,
           "failed",
@@ -159,15 +146,14 @@ export function createPlacementPendingFailureOps(runtime: PlacementStoreRuntime)
         if (removed.numAffectedRows !== 1n) {
           throw new Error(`Session ${sessionId} workspace result changed during failure`);
         }
-        return {
-          record: getRequired(db, sessionId),
-          releasedClaim,
-        };
+        sessionChanges.emit({ agentId: current.agentId, sessionKey: current.sessionKey }, db);
+        const record = getRequired(db, sessionId);
+        publishPlacementTurnClaimState(db, record);
+        if (releasedClaim) {
+          deferWorkerTurnClaimClosed(db, path, releasedClaim);
+        }
+        return record;
       });
-      if (outcome.releasedClaim) {
-        signalWorkerTurnClaimClosed(path, outcome.releasedClaim);
-      }
-      return outcome.record;
     },
   };
 }

@@ -15,9 +15,9 @@ export type MemoryConfig = {
   dbPath?: string;
   autoCapture?: boolean;
   autoRecall?: boolean;
-  captureMaxChars?: number;
+  captureMaxChars: number;
   customTriggers?: string[];
-  recallMaxChars?: number;
+  recallMaxChars: number;
   storageOptions?: Record<string, string>;
 };
 
@@ -51,9 +51,9 @@ export function vectorDimsForModel(model: string): number {
   return dims;
 }
 
-function resolveEnvVars(value: string): string {
+export function resolveEnvVars(value: string, env: NodeJS.ProcessEnv = process.env): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, envVar) => {
-    const envValue = process.env[envVar];
+    const envValue = env[envVar];
     if (!envValue) {
       throw new Error(`Environment variable ${envVar} is not set`);
     }

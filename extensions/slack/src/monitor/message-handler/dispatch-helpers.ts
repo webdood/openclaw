@@ -1,20 +1,18 @@
 import type { ChannelBotLoopProtectionFacts } from "openclaw/plugin-sdk/channel-inbound";
 import { resolveChannelProgressDraftConfig } from "openclaw/plugin-sdk/channel-outbound";
+import type { SlackAccountConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { mergePairLoopGuardConfig } from "openclaw/plugin-sdk/pair-loop-guard-runtime";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import type { ReplyDispatchKind, ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
-import { resolveSlackReplyRenderPlan } from "../../reply-blocks.js";
-import type { SlackMessageEvent } from "../../types.js";
+import { prepareSlackReply, type PreparedSlackReply } from "../../reply-blocks.js";
+import { readLruMapEntry, writeLruMapEntry } from "../lru-map-cache.js";
 import { readSlackReplyBlocks, resolveSlackThreadTs } from "../replies.js";
 import { resolveSlackTimestampMs } from "./timestamp.js";
 import type { PreparedSlackMessage } from "./types.js";
 
-function resolveSlackMessageTimestampMs(message: SlackMessageEvent): number | undefined {
-  const ts = message.event_ts ?? message.ts;
-  return resolveSlackTimestampMs(ts);
-}
+type SlackProgressConfigEntry = Pick<SlackAccountConfig, "streaming"> | null | undefined;
 
 export function resolveSlackBotLoopProtection(
   prepared: PreparedSlackMessage,
@@ -42,7 +40,7 @@ export function resolveSlackBotLoopProtection(
     ),
     defaultsConfig: prepared.ctx.cfg.channels?.defaults?.botLoopProtection,
     defaultEnabled: true,
-    nowMs: resolveSlackMessageTimestampMs(prepared.message),
+    nowMs: resolveSlackTimestampMs(prepared.message.event_ts ?? prepared.message.ts),
   };
 }
 
@@ -84,11 +82,20 @@ export function resolveExplicitSlackProgressTitle(
   return trimmed && trimmed.toLowerCase() !== "auto" ? trimmed : undefined;
 }
 
+export function resolveSlackProgressStyle(entry: SlackProgressConfigEntry): "card" | "compact" {
+  // DO NOT REMOVE OR CHANGE THE COMPACT STYLE WITHOUT APPROVAL FROM SJF OR PASHPASHPASH.
+  const progress = entry?.streaming?.progress;
+  return progress?.style ?? (progress?.toolProgress === false ? "compact" : "card");
+}
+
 // Slack's native agent card is the default progress surface; operators opt out
 // with an explicit `false`, which falls back to the Block Kit progress card.
-export function resolveSlackNativeProgressTaskCards(
-  entry: Parameters<typeof resolveChannelProgressDraftConfig>[0],
-): boolean {
+export function resolveSlackNativeProgressTaskCards(entry: SlackProgressConfigEntry): boolean {
+  // THIS BEHAVIOR IS INTENTIONAL AND MUST NOT BE CASUALLY ADJUSTED.
+  // DO NOT CHANGE THIS WITHOUT APPROVAL FROM SJF OR PASHPASHPASH.
+  if (resolveSlackProgressStyle(entry) === "compact") {
+    return false;
+  }
   const streaming = entry?.streaming;
   if (!streaming || typeof streaming !== "object" || Array.isArray(streaming)) {
     return true;
@@ -135,14 +142,14 @@ function getSlackStreamRecipientTeamCache(client: object): Map<string, string> {
   return cache;
 }
 
-function buildSlackEventDeliveryKey(params: SlackEventDeliveryAttempt): string | null {
+export function buildSlackEventDeliveryKey(
+  params: SlackEventDeliveryAttempt,
+  preparedReply: PreparedSlackReply = prepareSlackReply(params.payload),
+): string | null {
   const reply = resolveSendableOutboundReplyParts(params.payload, {
     text: params.textOverride,
   });
-  const renderPlan = resolveSlackReplyRenderPlan(
-    params.payload,
-    params.textOverride ?? params.payload.text,
-  );
+  const renderPlan = preparedReply.resolvePreview(params.textOverride);
   const plannedBlocks =
     renderPlan.mode === "single" ? renderPlan.blocks : renderPlan.blockPart?.blocks;
   const slackBlocks = readSlackReplyBlocks(params.payload) ?? plannedBlocks;
@@ -168,15 +175,10 @@ function readSlackStreamRecipientTeamCache(params: {
   if (!params.fallbackTeamId || !params.userId) {
     return undefined;
   }
-  const cacheKey = `${params.fallbackTeamId}:${params.userId}`;
-  const cache = getSlackStreamRecipientTeamCache(params.client);
-  const cached = cache.get(cacheKey);
-  if (!cached) {
-    return undefined;
-  }
-  cache.delete(cacheKey);
-  cache.set(cacheKey, cached);
-  return cached;
+  return readLruMapEntry(
+    getSlackStreamRecipientTeamCache(params.client),
+    `${params.fallbackTeamId}:${params.userId}`,
+  );
 }
 
 function rememberSlackStreamRecipientTeam(params: {
@@ -188,29 +190,21 @@ function rememberSlackStreamRecipientTeam(params: {
   if (!params.fallbackTeamId || !params.userId) {
     return;
   }
-  const cacheKey = `${params.fallbackTeamId}:${params.userId}`;
-  const cache = getSlackStreamRecipientTeamCache(params.client);
-  if (cache.has(cacheKey)) {
-    cache.delete(cacheKey);
-  }
-  cache.set(cacheKey, params.teamId);
-  if (cache.size > SLACK_STREAM_RECIPIENT_TEAM_CACHE_MAX) {
-    const oldest = cache.keys().next().value;
-    if (oldest) {
-      cache.delete(oldest);
-    }
-  }
+  writeLruMapEntry(
+    getSlackStreamRecipientTeamCache(params.client),
+    `${params.fallbackTeamId}:${params.userId}`,
+    params.teamId,
+    SLACK_STREAM_RECIPIENT_TEAM_CACHE_MAX,
+  );
 }
 
 export function createSlackEventDeliveryTracker() {
   const deliveredKeys = new Set<string>();
   return {
-    hasDelivered(params: SlackEventDeliveryAttempt) {
-      const key = buildSlackEventDeliveryKey(params);
+    hasDelivered(key: string | null) {
       return key ? deliveredKeys.has(key) : false;
     },
-    markDelivered(params: SlackEventDeliveryAttempt) {
-      const key = buildSlackEventDeliveryKey(params);
+    markDelivered(key: string | null) {
       if (key) {
         deliveredKeys.add(key);
       }

@@ -19,10 +19,6 @@ import {
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveSignalAccount } from "./accounts.js";
-import {
-  appendSignalApprovalReactionHintForOutboundMessage,
-  registerSignalApprovalReactionTargetForOutboundMessage,
-} from "./approval-reactions.js";
 import { signalRpcRequest, type SignalTransportKind } from "./client-adapter.js";
 import { markdownToSignalText, type SignalTextStyleRange } from "./format.js";
 import { normalizeSignalMessagingTarget } from "./normalize.js";
@@ -46,6 +42,8 @@ export type SignalSendOpts = {
   replyToId?: string | null;
   replyToAuthor?: string | null;
   replyToBody?: string | null;
+  /** Revalidate the originating request before every daemon mutation. */
+  assertDirectAdapterHandoff?: () => void;
 };
 
 export type SignalSendResult = {
@@ -146,35 +144,14 @@ type SignalTargetParams = {
   username?: string[];
 };
 
-type SignalTargetAllowlist = {
-  recipient?: boolean;
-  group?: boolean;
-  username?: boolean;
-};
-
-function buildTargetParams(
-  target: SignalTarget,
-  allow: SignalTargetAllowlist,
-): SignalTargetParams | null {
+function buildTargetParams(target: SignalTarget): SignalTargetParams {
   if (target.type === "recipient") {
-    if (!allow.recipient) {
-      return null;
-    }
     return { recipient: [target.recipient] };
   }
   if (target.type === "group") {
-    if (!allow.group) {
-      return null;
-    }
     return { groupId: target.groupId };
   }
-  if (target.type === "username") {
-    if (!allow.username) {
-      return null;
-    }
-    return { username: [target.username] };
-  }
-  return null;
+  return { username: [target.username] };
 }
 
 function createSignalSendReceipt(params: {
@@ -303,14 +280,7 @@ export async function sendMessageSignal(
   const target = parseTarget(to);
   const targetAuthor = normalizeOptionalString(account);
   const targetAuthorUuid = normalizeOptionalString(accountInfo.config.accountUuid);
-  const outboundText = appendSignalApprovalReactionHintForOutboundMessage({
-    cfg,
-    accountId: accountInfo.accountId,
-    to,
-    text: text ?? "",
-    targetAuthor,
-    targetAuthorUuid,
-  });
+  const outboundText = text ?? "";
   let message = outboundText;
   let outboundMedia: MediaPlaceholderTextFact | undefined;
   let textStyles: SignalTextStyleRange[] = [];
@@ -374,15 +344,7 @@ export async function sendMessageSignal(
     params.attachments = attachments;
   }
 
-  const targetParams = buildTargetParams(target, {
-    recipient: true,
-    group: true,
-    username: true,
-  });
-  if (!targetParams) {
-    throw new Error("Signal recipient is required");
-  }
-  Object.assign(params, targetParams);
+  Object.assign(params, buildTargetParams(target));
 
   const quote = resolveSignalQuoteParams(opts);
   const sendOpts = {
@@ -390,6 +352,7 @@ export async function sendMessageSignal(
     timeoutMs: opts.timeoutMs,
     transportKind: opts.transportKind ?? accountInfo.transport.kind,
     maxAttachmentBytes: maxBytes,
+    assertDirectAdapterHandoff: opts.assertDirectAdapterHandoff,
   };
   let nativeReplyStatus: "sent" | "fallback" | undefined;
   let result: SignalSendRpcResult | undefined;
@@ -426,15 +389,6 @@ export async function sendMessageSignal(
       sourceTimestamp: timestamp,
     });
   }
-  registerSignalApprovalReactionTargetForOutboundMessage({
-    cfg,
-    accountId: accountInfo.accountId,
-    to,
-    messageId,
-    text: outboundText,
-    targetAuthor,
-    targetAuthorUuid,
-  });
   return {
     messageId,
     timestamp,
@@ -454,14 +408,11 @@ export async function sendTypingSignal(
 ): Promise<boolean> {
   const accountInfo = await resolveSignalRpcAccountInfo(opts);
   const { baseUrl, account } = resolveSignalRpcContext(opts, accountInfo);
-  const targetParams = buildTargetParams(parseTarget(to), {
-    recipient: true,
-    group: true,
-  });
-  if (!targetParams) {
+  const target = parseTarget(to);
+  if (target.type === "username") {
     return false;
   }
-  const params: Record<string, unknown> = { ...targetParams };
+  const params: Record<string, unknown> = buildTargetParams(target);
   if (account) {
     params.account = account;
   }
@@ -486,14 +437,12 @@ export async function sendReadReceiptSignal(
   }
   const accountInfo = await resolveSignalRpcAccountInfo(opts);
   const { baseUrl, account } = resolveSignalRpcContext(opts, accountInfo);
-  const targetParams = buildTargetParams(parseTarget(to), {
-    recipient: true,
-  });
-  if (!targetParams) {
+  const target = parseTarget(to);
+  if (target.type !== "recipient") {
     return false;
   }
   const params: Record<string, unknown> = {
-    ...targetParams,
+    ...buildTargetParams(target),
     targetTimestamp,
     type: opts.type ?? "read",
   };

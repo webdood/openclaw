@@ -9,7 +9,6 @@ defineDiscordVoiceTests(
     ChannelType,
     createDefaultVoiceStates,
     createConnectionMock,
-    getVoiceConnectionMock,
     joinVoiceChannelMock,
     agentCommandMock,
     realtimeSessionMock,
@@ -529,7 +528,7 @@ defineDiscordVoiceTests(
         if (channelId === "1002") {
           backupFetches += 1;
           if (backupFetches > 1) {
-            return null;
+            throw new Error("followed channel unavailable");
           }
         }
         return {
@@ -751,20 +750,23 @@ defineDiscordVoiceTests(
       expectConnectedStatus(manager, "1001");
     });
 
-    it("skips destroying stale tracked voice connections that are already destroyed", async () => {
-      const staleConnection = createConnectionMock();
-      staleConnection.state.status = "destroyed";
-      staleConnection.destroy.mockImplementation(() => {
-        throw new Error("Cannot destroy VoiceConnection - it has already been destroyed");
-      });
-      getVoiceConnectionMock.mockReturnValueOnce(staleConnection);
-      joinVoiceChannelMock.mockReturnValueOnce(createConnectionMock());
-      const manager = createManager();
+    it("does not rejoin an empty occupancy-managed target after the bot is moved", async () => {
+      const manager = createManager(
+        makeVoiceConfig({
+          autoJoin: [{ guildId: "g1", channelId: "1001", whenOccupied: true }],
+          allowedChannels: [{ guildId: "g1", channelId: "1001" }],
+        }),
+        undefined,
+        {},
+        "default",
+        "bot-user",
+      );
+      await manager.join({ guildId: "g1", channelId: "1001" });
 
-      const result = await manager.join({ guildId: "g1", channelId: "1001" });
-      expect(result.ok).toBe(true);
+      await updateVoiceState(manager, "bot-user", "1002");
 
-      expect(staleConnection.destroy).not.toHaveBeenCalled();
+      expect(joinVoiceChannelMock).toHaveBeenCalledTimes(1);
+      expect(manager.status()).toEqual([]);
     });
 
     it("skips destroying an already destroyed voice connection on leave", async () => {

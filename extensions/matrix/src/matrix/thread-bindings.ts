@@ -1,8 +1,7 @@
-// Matrix plugin module implements thread bindings behavior.
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { resolveSessionAgentId } from "openclaw/plugin-sdk/agent-scope-runtime";
+import { resolveSessionAgentIdStrict } from "openclaw/plugin-sdk/agent-scope-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { readJsonFileWithFallback } from "openclaw/plugin-sdk/json-store";
 import { resolveAgentIdFromSessionKey } from "openclaw/plugin-sdk/session-key-runtime";
@@ -10,6 +9,7 @@ import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runti
 import {
   registerSessionBindingAdapter,
   resolveThreadBindingFarewellText,
+  resolveThreadBindingLifecycle,
   type SessionBindingAdapter,
   unregisterSessionBindingAdapter,
 } from "openclaw/plugin-sdk/thread-bindings-session-runtime";
@@ -26,7 +26,6 @@ import {
   listBindingsForAccount,
   removeBindingRecord,
   resolveBindingKey,
-  resolveEffectiveBindingExpiry,
   setBindingRecord,
   setMatrixThreadBindingManagerEntry,
   toMatrixBindingTargetKind,
@@ -51,12 +50,12 @@ type MatrixThreadBindingMigrationMarker = {
   importedAt: number;
 };
 
-function resolveBindingsPath(params: {
+async function resolveBindingsPath(params: {
   auth: MatrixAuth;
   accountId: string;
   env?: NodeJS.ProcessEnv;
   stateDir?: string;
-}): string {
+}): Promise<string> {
   return resolveMatrixStateFilePath({
     auth: params.auth,
     accountId: params.accountId,
@@ -303,7 +302,7 @@ export async function createMatrixThreadBindingManager(params: {
       `Matrix thread binding account mismatch: requested ${params.accountId}, auth resolved ${params.auth.accountId}`,
     );
   }
-  const legacyFilePath = resolveBindingsPath({
+  const legacyFilePath = await resolveBindingsPath({
     auth: params.auth,
     accountId: params.accountId,
     env: params.env,
@@ -316,7 +315,7 @@ export async function createMatrixThreadBindingManager(params: {
     if (existingEntry.storageKey === storageKey) {
       return existingEntry.manager;
     }
-    existingEntry.manager.stop();
+    await existingEntry.manager.stop();
   }
   const pluginLoaded = await loadBindingsFromPluginState({
     accountId: params.accountId,
@@ -360,7 +359,7 @@ export async function createMatrixThreadBindingManager(params: {
           env: params.env,
           stateDir: sqliteStateDir,
         });
-        claimCurrentTokenStorageState({ rootDir: sqliteStateDir });
+        await claimCurrentTokenStorageState({ rootDir: sqliteStateDir });
       });
     persistQueue = next;
     return next;
@@ -482,15 +481,18 @@ export async function createMatrixThreadBindingManager(params: {
         }),
       });
     },
-    stop: () => {
+    stop: async () => {
       if (sweepTimer) {
         clearInterval(sweepTimer);
       }
+      let finalPersist = persistQueue;
       if (persistTimer) {
         clearTimeout(persistTimer);
         persistTimer = null;
-        persistSafely("shutdown-flush");
+        finalPersist = enqueuePersist();
       }
+      // Retire the live generation now, but settle its captured persistence before
+      // shutdown can close the shared Matrix state store.
       unregisterSessionBindingAdapter({
         channel: "matrix",
         accountId: params.accountId,
@@ -503,14 +505,12 @@ export async function createMatrixThreadBindingManager(params: {
           removeBindingRecord(record);
         }
       }
+      await finalPersist;
     },
   };
 
   let sweepTimer: NodeJS.Timeout | null = null;
   const removeRecords = (records: MatrixThreadBindingRecord[]) => {
-    if (records.length === 0) {
-      return [];
-    }
     return records
       .map((record) => removeBindingRecord(record))
       .filter((record): record is MatrixThreadBindingRecord => Boolean(record));
@@ -587,7 +587,7 @@ export async function createMatrixThreadBindingManager(params: {
         targetSessionKey,
         agentId:
           normalizeOptionalString(input.metadata?.agentId) ??
-          resolveSessionAgentId({ config: params.cfg, sessionKey: targetSessionKey }),
+          resolveSessionAgentIdStrict({ config: params.cfg, sessionKey: targetSessionKey }),
         label: normalizeOptionalString(input.metadata?.label) || undefined,
         boundBy: normalizeOptionalString(input.metadata?.boundBy) || "system",
         boundAt: now,
@@ -655,7 +655,7 @@ export async function createMatrixThreadBindingManager(params: {
       const expired = listBindingsForAccount(params.accountId)
         .map((record) => ({
           record,
-          lifecycle: resolveEffectiveBindingExpiry({
+          lifecycle: resolveThreadBindingLifecycle({
             record,
             defaultIdleTimeoutMs: defaults.idleTimeoutMs,
             defaultMaxAgeMs: defaults.maxAgeMs,

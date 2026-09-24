@@ -17,6 +17,8 @@ export type TuiOptions = {
   timeoutMs?: number;
   historyLimit?: number;
   message?: string;
+  /** Overrides timeoutMs only for the message sent automatically at startup. */
+  initialMessageTimeoutMs?: number;
   /**
    * Internal CLI guard: after the standalone TUI returns, force the child
    * process out if imported runtime handles keep the event loop alive.
@@ -31,8 +33,13 @@ export type TuiResult = {
   systemAgentMessage?: string;
 };
 
+export type TuiHistoryRunOutcome =
+  | { state: "active"; runId: string }
+  | { state: "completed" | "interrupted" }
+  | { state: "failed"; errorMessage: string };
+
 export type TuiHistoryLoadResult =
-  | { loaded: true; inFlightRunId: string | null }
+  | { loaded: true; runOutcome: TuiHistoryRunOutcome; activeRunIds?: string[] }
   | { loaded: false };
 
 export type ChatEvent = {
@@ -72,6 +79,7 @@ export type SessionChangedEvent = {
    * and null mean different things to consumers.
    */
   label?: string | null;
+  activeRunIds?: string[] | null;
 };
 
 export type SessionMessageEvent = {
@@ -134,14 +142,6 @@ export type AgentSummary = {
   name?: string;
 };
 
-type QueuedMessageMode = "steer" | "followUp";
-
-type QueuedMessage = {
-  runId: string;
-  text: string;
-  mode: QueuedMessageMode;
-};
-
 export type GatewayStatusSummary = {
   runtimeVersion?: string | null;
   linkChannel?: {
@@ -159,7 +159,7 @@ export type GatewayStatusSummary = {
       everyMs?: number | null;
     }>;
   };
-  providerSummary?: string[];
+  channelSummary?: string[];
   queuedSystemEvents?: string[];
   sessions?: {
     paths?: string[];
@@ -193,7 +193,6 @@ export type TuiStateAccess = {
   sessionProjection?: SessionProjectionState;
   activeChatRunId: string | null;
   pendingSubmit: TuiPendingSubmit | null;
-  queuedMessages?: QueuedMessage[];
   historyLoaded: boolean;
   sessionInfo: SessionInfo;
   initialSessionApplied: boolean;

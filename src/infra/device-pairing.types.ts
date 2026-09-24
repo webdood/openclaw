@@ -6,6 +6,7 @@ import type {
   DeviceBootstrapProfile,
   PairingSetupAccess,
 } from "../shared/device-bootstrap-profile.js";
+import type { NodeHostStats } from "../shared/node-host-stats.js";
 
 /** Pending device pairing request awaiting owner approval. */
 export type DevicePairingPendingRequest = {
@@ -33,6 +34,11 @@ export type DevicePairingPendingRequest = {
 // crosses the protocol boundary, and ordering/--latest still use ts.
 export type DevicePairingPendingRecord = DevicePairingPendingRequest & {
   refreshedAtMs?: number;
+};
+
+export type DevicePairingStoreState = {
+  pendingById: Record<string, DevicePairingPendingRecord>;
+  pairedByDeviceId: Record<string, PairedDevice>;
 };
 
 /** Bearer token issued to one paired device role. */
@@ -85,10 +91,13 @@ export type PairedDeviceNodeSurface = {
   commands?: string[];
   permissions?: Record<string, boolean>;
   bins?: string[];
+  /** Last current-generation runner publication explicitly enabled session hosting. */
+  sessionHost?: boolean;
   createdAtMs: number;
   approvedAtMs: number;
   lastConnectedAtMs?: number;
   lastDisconnectedAtMs?: number;
+  lastHostStats?: NodeHostStats;
 };
 
 /**

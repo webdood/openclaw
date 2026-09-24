@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { expect, vi } from "vitest";
+import { resolveRuntimeWorkerUrl } from "../../infra/runtime-worker-url.js";
 import type { WorkerSshEndpoint } from "../../plugins/types.js";
 import {
   runCommandWithTimeout,
@@ -11,6 +11,7 @@ import {
 } from "../../process/exec.js";
 import type { WorkerSshProcess, WorkerSshRunner } from "./tunnel-ssh-runner.js";
 import { createWorkerTunnelManager } from "./tunnel.js";
+import { workspaceProcessTestEntrypoints } from "./workspace-process-runtime.test-support.js";
 import type {
   WorkerWorkspaceReconciliationJournal,
   WorkerWorkspaceReconciliationJournalAdapter,
@@ -88,6 +89,15 @@ function rsyncReceiverInvocation(argv: readonly string[]) {
   return { receiverEntryPath, target };
 }
 
+export async function prepareLocalWorkspaceRsyncReceiver(receiverEntry: string): Promise<void> {
+  await fs.mkdir(path.dirname(receiverEntry), { recursive: true });
+  const receiverUrl = resolveRuntimeWorkerUrl(workspaceProcessTestEntrypoints.rsyncReceiver);
+  const source = receiverUrl.pathname.endsWith(".ts")
+    ? `import { tsImport } from ${JSON.stringify(import.meta.resolve("tsx/esm/api"))};\nawait tsImport(${JSON.stringify(receiverUrl.href)}, import.meta.url);\n`
+    : `await import(${JSON.stringify(receiverUrl.href)});\n`;
+  await fs.writeFile(receiverEntry, source);
+}
+
 export async function prepareLocalWorkspaceRsyncBoundary(
   remoteHome: string,
   argv: readonly string[],
@@ -97,13 +107,7 @@ export async function prepareLocalWorkspaceRsyncBoundary(
     throw new Error("test rsync transfer is missing its bundled receiver invocation");
   }
   const receiverEntry = path.join(remoteHome, invocation.receiverEntryPath);
-  await fs.mkdir(path.dirname(receiverEntry), { recursive: true });
-  const tsxApi = import.meta.resolve("tsx/esm/api");
-  const sourceEntry = pathToFileURL(path.resolve("src/worker/workspace-rsync-receiver.ts")).href;
-  await fs.writeFile(
-    receiverEntry,
-    `import { tsImport } from ${JSON.stringify(tsxApi)};\nawait tsImport(${JSON.stringify(sourceEntry)}, import.meta.url);\n`,
-  );
+  await prepareLocalWorkspaceRsyncReceiver(receiverEntry);
   const fakeSsh = path.join(remoteHome, ".openclaw-test-ssh");
   await fs.writeFile(
     fakeSsh,
@@ -200,6 +204,7 @@ class FakeProcess implements WorkerSshProcess {
   readonly ready = this.readyDeferred.promise;
   readonly exited = this.exitDeferred.promise;
   stopCount = 0;
+  private stopPromise?: Promise<void>;
   private stopBarrier: Promise<void> | undefined;
 
   becomeReady() {
@@ -219,11 +224,13 @@ class FakeProcess implements WorkerSshProcess {
     this.stopBarrier = barrier;
   }
 
-  async stop() {
-    this.stopCount += 1;
-    await this.stopBarrier;
-    this.readyDeferred.reject(new Error("stopped"));
-    this.exitDeferred.resolve({ code: null, signal: "SIGTERM" });
+  stop() {
+    return (this.stopPromise ??= (async () => {
+      this.stopCount += 1;
+      await this.stopBarrier;
+      this.readyDeferred.reject(new Error("stopped"));
+      this.exitDeferred.resolve({ code: null, signal: "SIGTERM" });
+    })());
   }
 }
 
@@ -319,14 +326,6 @@ export function localWorkspaceRunner(
         return await runCommandWithTimeout(localArgv, options);
       }
       if (argv[0] === "ssh") {
-        if (
-          typeof options.input === "string" &&
-          options.input.includes("unsafe worker tunnel directory")
-        ) {
-          const result = success();
-          onCommandCompleted?.(argv, result);
-          return result;
-        }
         const remoteCommand = argv.at(-1);
         if (!remoteCommand) {
           throw new Error("missing test SSH remote command");
@@ -360,8 +359,7 @@ export async function waitForStarts(starts: unknown[], count: number) {
   await waitForFast(() => expect(starts).toHaveLength(count));
 }
 
-type TunnelTestFake = Pick<ReturnType<typeof fakeRunner>, "runner" | "starts">;
-type TunnelManagerOptions = NonNullable<Parameters<typeof createWorkerTunnelManager>[0]>;
+type TunnelTestFake = Pick<ReturnType<typeof fakeRunner>, "runner">;
 type TunnelManager = ReturnType<typeof createWorkerTunnelManager>;
 
 export function startTestTunnel(
@@ -377,7 +375,6 @@ export function startTestTunnel(
     bundleHash: BUNDLE_HASH,
     ssh,
     sharedHost,
-    gateway: { host: "127.0.0.1", port: 18789 },
     resolveIdentity,
   });
 }
@@ -389,21 +386,15 @@ export async function startConnectedTunnel(
   options: {
     ssh?: WorkerSshEndpoint;
     sharedHost?: boolean;
-    manager?: Omit<TunnelManagerOptions, "runner">;
-    beforeReady?: (start: TunnelTestFake["starts"][number]) => void;
   } = {},
 ) {
-  const manager = createWorkerTunnelManager({ ...options.manager, runner: fake.runner });
-  const starting = startTestTunnel(
+  const manager = createWorkerTunnelManager({ runner: fake.runner });
+  const handle = await startTestTunnel(
     manager,
     environmentId,
     ownerEpoch,
     options.ssh,
     options.sharedHost,
   );
-  await waitForStarts(fake.starts, 1);
-  const start = fake.starts[0]!;
-  options.beforeReady?.(start);
-  start.process.becomeReady();
-  return { manager, handle: await starting, start };
+  return { manager, handle };
 }

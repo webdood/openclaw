@@ -3,7 +3,8 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, it, expect } from "vitest";
 import { createModelVisibilityPolicy } from "../../../agents/model-visibility-policy.js";
-import type { OpenClawConfig } from "../../../config/types.js";
+import type { AgentModelEntryConfig, OpenClawConfig } from "../../../config/types.js";
+import { validateConfigObjectRaw } from "../../../config/validation-core.js";
 import { legacyCodexProviderIdentityKey } from "./codex-route-model-ref.js";
 import {
   collectBlockedLegacyOpenAICodexProviderPlan,
@@ -43,6 +44,16 @@ describe("model compat catalog ownership migration", () => {
     const raw = {
       models: {
         providers: {
+          anthropic: {
+            api: "anthropic-messages",
+            baseUrl: "https://api.anthropic.com/v1",
+            models: [
+              {
+                id: "claude-haiku-4-5",
+                compat: { codeMode: "capable", supportsTemperature: true },
+              },
+            ],
+          },
           openai: {
             api: "openai-responses",
             baseUrl: "https://api.openai.com/v1",
@@ -71,8 +82,10 @@ describe("model compat catalog ownership migration", () => {
     ]);
     migration?.apply(raw, changes);
 
+    expect(raw.models.providers.anthropic.models[0]?.compat).toEqual({ supportsTemperature: true });
     expect(raw.models.providers.openai.models[0]?.compat).toEqual({ supportsTemperature: true });
     expect(changes).toEqual([
+      "Removed models.providers.anthropic.models.0.compat catalog/dead overrides: codeMode.",
       "Removed models.providers.openai.models.0.compat catalog/dead overrides: nativeWebSearchTool, requiresMistralToolIds, supportsReasoningEffort.",
     ]);
     expect(rules.map((rule) => rule.match?.(raw.models.providers, raw))).toEqual([
@@ -86,6 +99,11 @@ describe("model compat catalog ownership migration", () => {
     const raw = {
       models: {
         providers: {
+          anthropic: {
+            api: "anthropic-messages",
+            baseUrl: "http://127.0.0.1:9200/v1",
+            models: [{ id: "claude-haiku-4-5", compat: { codeMode: "capable" } }],
+          },
           custom: {
             api: "openai-completions",
             baseUrl: "http://127.0.0.1:9000/v1",
@@ -103,6 +121,7 @@ describe("model compat catalog ownership migration", () => {
 
     migration?.apply(raw, changes);
 
+    expect(raw.models.providers.anthropic.models[0]?.compat).toEqual({ codeMode: "capable" });
     expect(raw.models.providers.custom.models[0]?.compat).toEqual({ supportsTools: false });
     expect(raw.models.providers.openai.models[0]?.compat).toEqual({
       supportsReasoningEffort: true,
@@ -114,6 +133,46 @@ describe("model compat catalog ownership migration", () => {
 describe("explicit model allow policy migration", () => {
   const migration = LEGACY_CONFIG_MIGRATIONS_RUNTIME_MODELS.find(
     (entry) => entry.id === "agents.defaults.models->agents.defaults.modelPolicy.allow",
+  );
+
+  const deferredCases: Array<{ name: string; models: Record<string, AgentModelEntryConfig> }> = [
+    { name: "all-bare", models: { bare: {} } },
+    { name: "mixed", models: { bare: {}, "demo/*": {} } },
+  ];
+  it.each(deferredCases)(
+    "defers the entire $name legacy restriction without invalidating config",
+    ({ models }) => {
+      const raw: OpenClawConfig = {
+        agents: {
+          defaults: { models },
+          ownership: "explicit",
+          entries: {
+            first: { models: { "first/bare": {} } },
+            second: { models: { "second/bare": {} } },
+          },
+        },
+      };
+      const before = structuredClone(raw);
+      const changes: string[] = [];
+
+      migration?.apply(raw, changes);
+
+      expect(validateConfigObjectRaw(raw).ok).toBe(true);
+      expect(raw).toEqual(before);
+      expect(changes).toEqual([]);
+      expect(migration?.legacyRules?.[1]?.match?.(models, raw)).toBe(true);
+      for (const agentId of ["first", "second"]) {
+        const policy = createModelVisibilityPolicy({
+          cfg: raw,
+          catalog: [],
+          defaultProvider: "default",
+          agentId,
+        });
+        expect(policy.allowAny).toBe(false);
+        expect(policy.allows({ provider: agentId, model: "bare" })).toBe(true);
+        expect(policy.allows({ provider: "unrelated", model: "denied" })).toBe(false);
+      }
+    },
   );
 
   it("preserves a legacy restriction after an unrelated new-version write", () => {
@@ -227,7 +286,7 @@ describe("explicit model allow policy migration", () => {
     };
     const changes: string[] = [];
 
-    expect(migration?.legacyRules).toHaveLength(1);
+    expect(migration?.legacyRules).toHaveLength(2);
     migration?.apply(raw, changes);
 
     expect(raw.agents.list[0]).not.toHaveProperty("modelPolicy");
@@ -270,7 +329,12 @@ describe("legacy Codex policy wildcard migration", () => {
         defaults: {},
         list: [{ id: "worker", modelPolicy: { allow: ["codex/*"] } }],
       },
-      expectedPath: "agents.list.0.modelPolicy.allow.0",
+      expectedPath: "agents.list[0].modelPolicy.allow.0",
+    },
+    {
+      name: "keyed per-agent policy",
+      agents: { entries: { worker: { modelPolicy: { allow: ["codex/*"] } } } },
+      expectedPath: "agents.entries.worker.modelPolicy.allow.0",
     },
   ])("retains the legacy provider for a $name", ({ agents, expectedPath }) => {
     const raw = {

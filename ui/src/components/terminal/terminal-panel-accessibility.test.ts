@@ -53,7 +53,7 @@ describe("OpenClawTerminalPanel accessibility", () => {
 
     // The occupied dock (bottom by default) has nowhere to move to, so its
     // button drops out of the cluster instead of rendering a pressed state.
-    const switcher = panel.renderRoot.querySelector('[role="group"]');
+    const switcher = panel.renderRoot.querySelector('.tp-actions [role="group"]');
     expect(switcher?.getAttribute("aria-label")).toBe("Terminal panel position");
     expect(
       ["Dock to right", "Fill main content area"].every((label) =>
@@ -82,29 +82,29 @@ describe("OpenClawTerminalPanel accessibility", () => {
     window.removeEventListener(TERMINAL_PANEL_DOCK_BOTTOM_EVENT, event);
   });
 
-  it("opens the base-mounted full-screen terminal in an isolated tab", async () => {
+  it("opens the base-mounted focused terminal in an isolated tab", async () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
     const panel = createPanel(createPickerClient());
     panel.basePath = "/openclaw";
     await waitForFast(() =>
       expect(
-        panel.renderRoot.querySelector('[aria-label="Open full-screen terminal"]'),
+        panel.renderRoot.querySelector('[aria-label="Open terminal in new window"]'),
       ).not.toBeNull(),
     );
 
     panel.renderRoot
-      .querySelector<HTMLButtonElement>('[aria-label="Open full-screen terminal"]')
+      .querySelector<HTMLButtonElement>('[aria-label="Open terminal in new window"]')
       ?.click();
 
     expect(open).toHaveBeenCalledWith(
-      "http://localhost:3000/openclaw/terminal",
+      "http://localhost:3000/openclaw/focus/terminal",
       "_blank",
       "noopener,noreferrer",
     );
 
     panel.fullscreen = true;
     await panel.updateComplete;
-    expect(panel.renderRoot.querySelector('[aria-label="Open full-screen terminal"]')).toBeNull();
+    expect(panel.renderRoot.querySelector('[aria-label="Open terminal in new window"]')).toBeNull();
     open.mockRestore();
   });
 

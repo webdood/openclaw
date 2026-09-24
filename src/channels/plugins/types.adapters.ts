@@ -11,11 +11,12 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { GroupToolPolicyConfig } from "../../config/types.tools.js";
 import type { ChannelApprovalNativeRuntimeAdapter } from "../../infra/approval-handler-runtime-types.js";
 import type { ChannelApprovalKind } from "../../infra/approval-types.js";
-import type { ExecApprovalRequest, ExecApprovalResolved } from "../../infra/exec-approvals.js";
+import type { ExecApprovalRequest, ExecApprovalResolved } from "../../infra/exec-approvals-core.js";
 import type {
   PluginApprovalRequest,
   PluginApprovalResolved,
 } from "../../infra/plugin-approvals.js";
+import type { SystemAgentApprovalRequest } from "../../infra/system-agent-approvals.js";
 import type { ResolvedAgentRoute } from "../../routing/resolve-route.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import type { ResolverContext, SecretDefaults } from "../../secrets/runtime-shared.js";
@@ -81,6 +82,11 @@ export type ChannelAccountLinkState = "linked" | "not-linked" | "unknown";
 export type ChannelConfigAdapter<ResolvedAccount> = {
   listAccountIds: (cfg: OpenClawConfig) => string[];
   resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) => ResolvedAccount;
+  /** Operational account preparation; preferred over the synchronous compatibility hook. */
+  resolveAccountAsync?: (
+    cfg: OpenClawConfig,
+    accountId?: string | null,
+  ) => Promise<ResolvedAccount>;
   inspectAccount?: (cfg: OpenClawConfig, accountId?: string | null) => unknown;
   defaultAccountId?: (cfg: OpenClawConfig) => string;
   setAccountEnabled?: (params: {
@@ -121,6 +127,10 @@ export type ChannelConfigAdapter<ResolvedAccount> = {
     allowFrom: Array<string | number>;
   }) => string[];
   hasConfiguredState?: (params: { cfg: OpenClawConfig; env?: NodeJS.ProcessEnv }) => boolean;
+  hasConfiguredStateAsync?: (params: {
+    cfg: OpenClawConfig;
+    env?: NodeJS.ProcessEnv;
+  }) => Promise<boolean>;
   hasPersistedAuthState?: (params: { cfg: OpenClawConfig; env?: NodeJS.ProcessEnv }) => boolean;
   resolveDefaultTo?: (params: {
     cfg: OpenClawConfig;
@@ -292,6 +302,7 @@ type ChannelLoginWithQrStartResult = {
   qrDataUrl?: string;
   message: string;
   connected?: boolean;
+  sessionKey?: string;
 };
 
 type ChannelLoginWithQrWaitResult = {
@@ -321,6 +332,7 @@ export type ChannelGatewayAdapter<ResolvedAccount = unknown> = {
   }) => Promise<ChannelLoginWithQrStartResult>;
   loginWithQrWait?: (params: {
     accountId?: string;
+    sessionKey?: string;
     timeoutMs?: number;
     currentQrDataUrl?: string;
   }) => Promise<ChannelLoginWithQrWaitResult>;
@@ -349,6 +361,15 @@ export type ChannelHeartbeatAdapter = {
     accountId?: string | null;
     threadId?: string | number | null;
     deps?: ChannelHeartbeatDeps;
+  }) => Promise<void> | void;
+  /** Optional owned typing: recheck the guard after transport waits and honor cancellation. */
+  sendTypingGuarded?: (params: {
+    cfg: OpenClawConfig;
+    to: string;
+    accountId?: string | null;
+    threadId?: string | number | null;
+    signal: AbortSignal;
+    assertPlatformSendAuthorized: () => void;
   }) => Promise<void> | void;
   clearTyping?: (params: {
     cfg: OpenClawConfig;
@@ -553,7 +574,7 @@ type ChannelApprovalDeliveryAdapter = {
     cfg: OpenClawConfig;
     approvalKind: ChannelApprovalKind;
     target: ChannelApprovalForwardTarget;
-    request: ExecApprovalRequest | PluginApprovalRequest;
+    request: ExecApprovalRequest | PluginApprovalRequest | SystemAgentApprovalRequest;
   }) => boolean;
 };
 type ChannelApproveCommandBehavior =
@@ -615,7 +636,7 @@ export type ChannelApprovalCapability = ChannelApprovalAdapter & {
     accountId?: string | null;
     senderId?: string | null;
     action: "approve";
-    approvalKind: "exec" | "plugin";
+    approvalKind: ChannelApprovalKind;
   }) => {
     authorized: boolean;
     reason?: string;
@@ -736,82 +757,7 @@ export type ChannelConfiguredBindingProvider = {
   ) => ChannelConfiguredBindingConversationRef | null;
 };
 
-export type ChannelConversationBindingSupport = {
-  supportsCurrentConversationBinding?: boolean;
-  isCurrentConversationBindingSupported?: (params: { accountId: string }) => boolean;
-  /**
-   * Preferred placement when a command is started from a top-level conversation
-   * without an existing native thread id.
-   *
-   * - `current`: bind/spawn in the current conversation
-   * - `child`: create a child thread/conversation first
-   */
-  defaultTopLevelPlacement?: "current" | "child";
-  resolveConversationRef?: (params: {
-    accountId?: string | null;
-    conversationId: string;
-    parentConversationId?: string;
-    threadId?: string | number | null;
-  }) => {
-    conversationId: string;
-    parentConversationId?: string;
-  } | null;
-  buildBoundReplyPayload?: (params: {
-    operation: "acp-spawn";
-    placement: "current" | "child";
-    conversation: {
-      channel: string;
-      accountId?: string | null;
-      conversationId: string;
-      parentConversationId?: string;
-    };
-  }) =>
-    | Pick<ReplyPayload, "channelData" | "delivery" | "presentation">
-    | null
-    | Promise<Pick<ReplyPayload, "channelData" | "delivery" | "presentation"> | null>;
-  buildModelOverrideParentCandidates?: (params: {
-    parentConversationId?: string | null;
-  }) => string[] | null | undefined;
-  shouldStripThreadFromAnnounceOrigin?: (params: {
-    requester: {
-      channel?: string;
-      to?: string;
-      threadId?: string | number;
-    };
-    entry: {
-      channel?: string;
-      to?: string;
-      threadId?: string | number;
-    };
-  }) => boolean;
-  setIdleTimeoutBySessionKey?: (params: {
-    targetSessionKey: string;
-    accountId?: string | null;
-    idleTimeoutMs: number;
-  }) => Array<{
-    boundAt: number;
-    lastActivityAt: number;
-    idleTimeoutMs?: number;
-    maxAgeMs?: number;
-  }>;
-  setMaxAgeBySessionKey?: (params: {
-    targetSessionKey: string;
-    accountId?: string | null;
-    maxAgeMs: number;
-  }) => Array<{
-    boundAt: number;
-    lastActivityAt: number;
-    idleTimeoutMs?: number;
-    maxAgeMs?: number;
-  }>;
-  createManager?: (params: { cfg: OpenClawConfig; accountId?: string | null }) =>
-    | {
-        stop: () => void | Promise<void>;
-      }
-    | Promise<{
-        stop: () => void | Promise<void>;
-      }>;
-};
+export type { ChannelConversationBindingSupport } from "./types.conversation-bindings.js";
 
 type ChannelSecurityDmRouteContext<ResolvedAccount> = ChannelSecurityContext<ResolvedAccount> & {
   accountId: string;
@@ -847,4 +793,3 @@ export type ChannelSecurityAdapter<ResolvedAccount = unknown> = {
     ) => Promise<SecurityAuditFinding[]> | SecurityAuditFinding[]
   >;
 };
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

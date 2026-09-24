@@ -2,20 +2,24 @@
 import type { WebSocket } from "ws";
 import type { ConnectParams } from "../../../packages/gateway-protocol/src/schema/frames.js";
 import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
+import type { AuthenticatedGitHubIdentitySync } from "../github-user-identity.types.js";
+import type { GatewayOperatorAccessAuthority } from "../operator-access-policy.types.js";
+import type { GatewayOperatorRoleActor } from "../operator-role-actor.js";
 import type { PluginNodeCapabilityClient } from "../plugin-node-capability.js";
 import type { WorkerConnectionIdentity } from "../worker-environments/connection-identity.js";
+import type { GatewayWsBrowserOrigin, PreparedSessionProfile } from "./client-identity-types.js";
+import type { GatewayConnectionTransport } from "./connection-transport.js";
+
+export type { GatewayWsBrowserOrigin } from "./client-identity-types.js";
 
 export const GATEWAY_WS_CONNECTION_KIND_PROPERTY = "__openclawConnectionKind";
 export const GATEWAY_WS_PREAUTH_BUDGET_PROPERTY = "__openclawPreauthBudget";
-export const GATEWAY_WS_WORKER_INGRESS_PROPERTY = "__openclawWorkerIngress";
 type GatewayWsConnectionKind = "gateway" | "worker";
-export type GatewayWorkerIngress = "loopback" | "public";
 export type GatewayIngressWebSocket = WebSocket & {
   [GATEWAY_WS_CONNECTION_KIND_PROPERTY]?: GatewayWsConnectionKind;
   [GATEWAY_WS_PREAUTH_BUDGET_PROPERTY]?: {
     release(clientIp: string | undefined): void;
   };
-  [GATEWAY_WS_WORKER_INGRESS_PROPERTY]?: GatewayWorkerIngress;
   __openclawPreauthBudgetClaimed?: boolean;
   __openclawPreauthBudgetKey?: string;
 };
@@ -24,9 +28,13 @@ export type GatewayIngressWebSocket = WebSocket & {
  * Runtime WebSocket client state tracked by the gateway server.
  */
 export type GatewayWsClient = PluginNodeCapabilityClient & {
-  socket: WebSocket;
+  socket: GatewayConnectionTransport;
+  /** Physical WS liveness capability; absent on transports without ping/pong. */
+  webSocket?: Pick<WebSocket, "ping" | "once" | "off">;
   connect: ConnectParams;
   connId: string;
+  /** Host-owned transport retirement notification; never accepted from wire params. */
+  connectionSignal?: AbortSignal;
   connectionKind?: GatewayWsConnectionKind;
   worker?: WorkerConnectionIdentity;
   isDeviceTokenAuth?: boolean;
@@ -34,10 +42,17 @@ export type GatewayWsClient = PluginNodeCapabilityClient & {
   pairedClientId?: string;
   usesSharedGatewayAuth: boolean;
   sharedGatewaySessionGeneration?: string;
+  authPolicyGeneration?: string;
   presenceKey?: string;
+  /** Connection-owned timing facts, reconciled across live peers independently of the TTL cache. */
+  personPresence?: { onlineSince: number; lastActivityAt?: number };
   authenticatedUserId?: string;
   /** Verified Tailscale provider identity; generic proxy identities must not infer this. */
   authenticatedUserIsTailscaleProvider?: boolean;
+  authenticatedGitHubIdentitySync?: AuthenticatedGitHubIdentitySync;
+  /** Lifecycle-prepared canonical recipient; never a scope or authorization grant. */
+  preparedRecipientProfileId?: string;
+  preparedSessionProfile?: PreparedSessionProfile;
   authenticatedUserProfile?: {
     profileId: string;
     displayName: string | null;
@@ -46,11 +61,21 @@ export type GatewayWsClient = PluginNodeCapabilityClient & {
     updatedAt: number;
   };
   clientIp?: string;
+  /** Server-attested inputs for rechecking browser-origin policy after config publication. */
+  browserOrigin?: GatewayWsBrowserOrigin;
   internal?: {
     /** Handshake-attested direct-local transport; never accepted from wire params. */
     isLocalClient?: true;
+    /** Authenticated Control UI operator ingress; never accepted from wire params. */
+    authenticatedControlUi?: true;
+    /** Authenticated Control UI admin admission; never accepted from wire params. */
+    controlUiAdmin?: true;
     approvalRuntime?: boolean;
     agentRuntimeIdentity?: AgentRuntimeIdentity;
+    /** Server-attested role-policy actor; never accepted from WebSocket wire params. */
+    operatorRoleActor?: GatewayOperatorRoleActor;
+    /** Additional access captured at authenticated admission; independent of socket lifetime. */
+    operatorAccessAuthority?: GatewayOperatorAccessAuthority | null;
   };
   canvasHostUrl?: string;
   canvasCapability?: string;

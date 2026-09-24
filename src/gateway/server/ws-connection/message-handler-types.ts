@@ -1,5 +1,4 @@
 import type { IncomingMessage } from "node:http";
-import type { WebSocket } from "ws";
 import type {
   ConnectParams,
   RequestFrame,
@@ -11,13 +10,20 @@ import type { createSubsystemLogger } from "../../../logging/subsystem.js";
 import type { DeviceBootstrapProfile } from "../../../shared/device-bootstrap-profile.js";
 import type { AuthRateLimiter } from "../../auth-rate-limit.js";
 import type { GatewayAuthResult, ResolvedGatewayAuth } from "../../auth.js";
+import type { GatewayAttributedIngress } from "../../ingress-attribution.js";
 import type { GatewayMethodRegistry } from "../../methods/registry.js";
 import type { NodePairingAutoApproveClientIpSource } from "../../node-pairing-auto-approve.types.js";
 import type { NodeReapprovalCoordinator } from "../../node-reapproval-coordinator.js";
 import type { PluginNodeCapabilitySurface } from "../../plugin-node-capability.js";
-import type { GatewayRole } from "../../role-policy.js";
+import type { GatewayRole } from "../../role-policy.types.js";
+import type { GatewayConnectionWork } from "../../server-connection-work.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "../../server-methods/types.js";
-import type { GatewayWsClient, WsHandshakePhase } from "../ws-types.js";
+import type { GatewayClientRegistry } from "../client-registry.js";
+import type {
+  GatewayConnectionTransport,
+  PrepareGatewayAuthenticatedReceive,
+} from "../connection-transport.js";
+import type { GatewayWsBrowserOrigin, GatewayWsClient, WsHandshakePhase } from "../ws-types.js";
 import type { ControlUiPairingKind } from "./connect-policy.js";
 import type { resolvePairingLocality } from "./handshake-auth-helpers.js";
 import type { GatewayNodeLifecycleDispatchTracker } from "./node-lifecycle-dispatch.js";
@@ -32,9 +38,14 @@ export type WsOriginCheckMetrics = {
 type WsSendResult = { kind: "sent" | "unavailable" } | { kind: "serialization"; error: unknown };
 
 export type GatewayWsMessageHandlerParams = {
-  socket: WebSocket;
+  socket: GatewayConnectionTransport;
+  clients: GatewayClientRegistry;
+  prepareAuthenticatedReceive: PrepareGatewayAuthenticatedReceive;
+  connectionWork: GatewayConnectionWork;
   upgradeReq: IncomingMessage;
+  ingressAttribution: GatewayAttributedIngress;
   connId: string;
+  bootId: string;
   remoteAddr?: string;
   remotePort?: number;
   localAddr?: string;
@@ -56,6 +67,7 @@ export type GatewayWsMessageHandlerParams = {
   browserRateLimiter?: AuthRateLimiter;
   nodeReapprovalCoordinator?: NodeReapprovalCoordinator;
   isStartupPending?: () => boolean;
+  isPendingWorkerNodeSetup?: (setupId: string, deviceId: string) => boolean;
   gatewayMethods: string[];
   events: string[];
   extraHandlers: GatewayRequestHandlers;
@@ -92,7 +104,7 @@ export type GatewayConnectPhaseContext = {
   reportedClientIp?: string;
   reportedClientIpSource: NodePairingAutoApproveClientIpSource;
   hasBrowserOriginHeader: boolean;
-  enforceOriginCheckForAnyClient: boolean;
+  browserOrigin?: GatewayWsBrowserOrigin;
   browserRateLimitClientIp?: string;
   authRateLimiter?: AuthRateLimiter;
   clientLabel: string;
@@ -104,6 +116,8 @@ export type GatewayConnectPhaseContext = {
     options?: Parameters<typeof errorShape>[2],
   ) => void;
   sendFrame: (obj: unknown) => Promise<void>;
+  /** Retire pre-auth ingress limits once hello-ok is accepted by the transport. */
+  onHelloDelivered: () => void;
   isWebchatConnect: (params: ConnectParams | null | undefined) => boolean;
   runDetachedConnectWork: (run: () => Promise<void>, onError: (error: unknown) => void) => void;
   pendingNodePairingCleanup: {
@@ -127,6 +141,7 @@ export type AuthenticatedGatewayConnect = {
   isBrowserOperatorUi: boolean;
   isWebchat: boolean;
   isNativeAppUi: boolean;
+  startupPending: boolean;
   device: ConnectParams["device"] | null | undefined;
   devicePublicKey: string | null;
   deviceAuthPayloadVersion: "v2" | "v3" | null;

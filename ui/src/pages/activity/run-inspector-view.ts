@@ -1,13 +1,25 @@
-import { html, nothing, type TemplateResult } from "lit";
+import { html, nothing } from "lit";
 import type {
-  AuditRunInspectResult,
   ExecutionIdentityContextV1,
   PrincipalRefV1,
 } from "../../../../packages/gateway-protocol/src/schema/audit-run.js";
-import { pathForRoute } from "../../app-route-paths.ts";
 import { t } from "../../i18n/index.ts";
 import { registerActivityEnglish } from "../../i18n/locales/en-activity.ts";
-import { classifyRunInspection, type RunInspectorState } from "./run-inspector-model.ts";
+import {
+  renderRunInspectorDecisions,
+  renderRunInspectorMissingEvidence,
+  renderRunInspectorRemediation,
+  renderRunInspectorSafeRef,
+  runInspectorCoverageKey,
+  runInspectorCoverageLabel,
+} from "./run-inspector-evidence-view.ts";
+import {
+  activityRunInspectorSelectorHref,
+  classifyRunInspection,
+  type RunInspectorResult,
+  type RunInspectorSelector,
+  type RunInspectorState,
+} from "./run-inspector-model.ts";
 import "./run-inspector.css";
 
 registerActivityEnglish();
@@ -17,7 +29,11 @@ type EvidenceState = "present" | "absent" | "unknown" | "unsupported";
 type RunInspectorProps = {
   basePath: string;
   state: RunInspectorState;
+  selector: RunInspectorSelector | null;
+  selectorId: string | null;
+  onLoadMoreDecisions: () => void;
   onLoadMoreExecutions: () => void;
+  onRestart: () => void;
   onRetry: () => void;
 };
 
@@ -39,38 +55,10 @@ function evidenceStateLabel(state: EvidenceState): string {
   return t(`activity.runInspector.evidenceState.${state}`);
 }
 
-function coverageKey(
-  state: AuditRunInspectResult["coverage"]["state"],
-): "enforced" | "attributionOnly" | "unattributed" | "unknown" | "unsupported" {
-  return state === "attribution-only" ? "attributionOnly" : state;
-}
-
-function coverageLabel(state: AuditRunInspectResult["coverage"]["state"]): string {
-  return t(`activity.runInspector.coverage.${coverageKey(state)}.label`);
-}
-
-function renderSafeRef(value: string | number, mono = false, href?: string) {
-  const content = html`<bdi
-    class=${mono ? "run-inspector__ref mono" : "run-inspector__ref"}
-    dir="ltr"
-    >${value}</bdi
-  >`;
-  return href ? html`<a href=${href}>${content}</a>` : content;
-}
-
 function stateReason(label: string, state: EvidenceState): string | undefined {
-  switch (state) {
-    case "absent":
-      return t("activity.runInspector.reasons.absent", { label: label.toLowerCase() });
-    case "unknown":
-      return t("activity.runInspector.reasons.unknown", { label: label.toLowerCase() });
-    case "unsupported":
-      return t("activity.runInspector.reasons.unsupported", { label: label.toLowerCase() });
-    case "present":
-      return undefined;
-  }
-  const unreachable: never = state;
-  return unreachable;
+  return state === "present"
+    ? undefined
+    : t(`activity.runInspector.reasons.${state}`, { label: label.toLowerCase() });
 }
 
 function principalValues(principal: PrincipalRefV1 | undefined): FactValue[] {
@@ -95,6 +83,10 @@ function principalValues(principal: PrincipalRefV1 | undefined): FactValue[] {
   ];
 }
 
+function optionalReferenceValue(label: string, value: string | undefined): FactValue[] {
+  return value ? [{ label, value, mono: true }] : [];
+}
+
 function renderFact(fact: IdentityFact) {
   const values = fact.values ?? [];
   const reason = fact.reason ?? stateReason(fact.label, fact.state);
@@ -104,6 +96,7 @@ function renderFact(fact: IdentityFact) {
         <span>${fact.label}</span>
         <span
           class="run-inspector__state run-inspector__state--${fact.state}"
+          role="img"
           aria-label=${t("activity.runInspector.evidenceStateLabel", {
             state: evidenceStateLabel(fact.state),
           })}
@@ -112,32 +105,24 @@ function renderFact(fact: IdentityFact) {
         </span>
       </dt>
       <dd>
-        ${values.length > 0
-          ? html`<dl class="run-inspector__values">
-              ${values.map(
-                (item) => html`
-                  <div>
-                    <dt>${item.label}</dt>
-                    <dd>${renderSafeRef(item.value, item.mono, item.href)}</dd>
-                  </div>
-                `,
-              )}
-            </dl>`
-          : nothing}
+        ${
+          values.length > 0
+            ? html`<dl class="run-inspector__values">
+                ${values.map(
+                  (item) => html`
+                    <div>
+                      <dt>${item.label}</dt>
+                      <dd>${renderRunInspectorSafeRef(item.value, item.mono, item.href)}</dd>
+                    </div>
+                  `,
+                )}
+              </dl>`
+            : nothing
+        }
         ${reason ? html`<p class="run-inspector__reason">${reason}</p>` : nothing}
       </dd>
     </div>
   `;
-}
-
-function runInspectorHref(runId: string, basePath: string): string {
-  const search = new URLSearchParams({ view: "run", run: runId });
-  return `${pathForRoute("activity", basePath)}?${search.toString()}`;
-}
-
-function executionInspectorHref(executionId: string, basePath: string): string {
-  const search = new URLSearchParams({ view: "run", execution: executionId });
-  return `${pathForRoute("activity", basePath)}?${search.toString()}`;
 }
 
 function identityFacts(context: ExecutionIdentityContextV1, basePath: string): IdentityFact[] {
@@ -167,15 +152,10 @@ function identityFacts(context: ExecutionIdentityContextV1, basePath: string): I
           value: context.ingress.boundary,
           mono: true,
         },
-        ...(context.ingress.sourceRef
-          ? [
-              {
-                label: t("activity.runInspector.values.sourceReference"),
-                value: context.ingress.sourceRef,
-                mono: true,
-              },
-            ]
-          : []),
+        ...optionalReferenceValue(
+          t("activity.runInspector.values.sourceReference"),
+          context.ingress.sourceRef,
+        ),
       ],
     },
     {
@@ -197,15 +177,10 @@ function identityFacts(context: ExecutionIdentityContextV1, basePath: string): I
       state: sponsor?.state ?? "absent",
       values: [
         ...principalValues(sponsor?.principal),
-        ...(sponsor?.relationshipRef
-          ? [
-              {
-                label: t("activity.runInspector.values.relationshipReference"),
-                value: sponsor.relationshipRef,
-                mono: true,
-              },
-            ]
-          : []),
+        ...optionalReferenceValue(
+          t("activity.runInspector.values.relationshipReference"),
+          sponsor?.relationshipRef,
+        ),
       ],
     },
     {
@@ -217,15 +192,10 @@ function identityFacts(context: ExecutionIdentityContextV1, basePath: string): I
           value: context.agentDefinition.definitionRef,
           mono: true,
         },
-        ...(context.agentDefinition.revisionRef
-          ? [
-              {
-                label: t("activity.runInspector.values.revisionReference"),
-                value: context.agentDefinition.revisionRef,
-                mono: true,
-              },
-            ]
-          : []),
+        ...optionalReferenceValue(
+          t("activity.runInspector.values.revisionReference"),
+          context.agentDefinition.revisionRef,
+        ),
       ],
     },
     {
@@ -299,37 +269,25 @@ function identityFacts(context: ExecutionIdentityContextV1, basePath: string): I
                     label: t("activity.runInspector.values.parentRunReference"),
                     value: lineage.parentRunId,
                     mono: true,
-                    href: runInspectorHref(lineage.parentRunId, basePath),
+                    href: activityRunInspectorSelectorHref(
+                      { kind: "run", id: lineage.parentRunId },
+                      basePath,
+                    ),
                   },
                 ]
               : []),
-            ...(lineage.parentExecutionId
-              ? [
-                  {
-                    label: t("activity.runInspector.values.parentExecutionReference"),
-                    value: lineage.parentExecutionId,
-                    mono: true,
-                  },
-                ]
-              : []),
-            ...(lineage.parentContextId
-              ? [
-                  {
-                    label: t("activity.runInspector.values.parentContextReference"),
-                    value: lineage.parentContextId,
-                    mono: true,
-                  },
-                ]
-              : []),
-            ...(lineage.delegationRef
-              ? [
-                  {
-                    label: t("activity.runInspector.values.delegationReference"),
-                    value: lineage.delegationRef,
-                    mono: true,
-                  },
-                ]
-              : []),
+            ...optionalReferenceValue(
+              t("activity.runInspector.values.parentExecutionReference"),
+              lineage.parentExecutionId,
+            ),
+            ...optionalReferenceValue(
+              t("activity.runInspector.values.parentContextReference"),
+              lineage.parentContextId,
+            ),
+            ...optionalReferenceValue(
+              t("activity.runInspector.values.delegationReference"),
+              lineage.delegationRef,
+            ),
             ...principalValues(lineage.parentAgentPrincipal),
           ]
         : [],
@@ -338,106 +296,20 @@ function identityFacts(context: ExecutionIdentityContextV1, basePath: string): I
   ];
 }
 
-function renderMissingEvidence(values: readonly string[]) {
-  return html`
-    <section class="run-inspector__section" aria-labelledby="run-inspector-missing-heading">
-      <h3 id="run-inspector-missing-heading">
-        ${t("activity.runInspector.missingEvidenceHeading")}
-      </h3>
-      ${values.length === 0
-        ? html`<p>${t("activity.runInspector.noMissingEvidence")}</p>`
-        : html`<ul class="run-inspector__code-list">
-            ${values.map((value) => html`<li>${renderSafeRef(value, true)}</li>`)}
-          </ul>`}
-    </section>
-  `;
-}
-
-function renderRemediation(
-  remediation: readonly { code: string; text: string }[],
-): TemplateResult | typeof nothing {
-  if (remediation.length === 0) {
-    return nothing;
-  }
-  return html`
-    <section
-      class="run-inspector__section"
-      aria-label=${t("activity.runInspector.nextStepsHeading")}
-    >
-      <h3>${t("activity.runInspector.nextStepsHeading")}</h3>
-      <ul class="run-inspector__remediation-list">
-        ${remediation.map(
-          (item) => html`<li><span>${item.text}</span> ${renderSafeRef(item.code, true)}</li>`,
-        )}
-      </ul>
-    </section>
-  `;
-}
-
-function renderDecisions(result: AuditRunInspectResult) {
-  return html`
-    <section class="run-inspector__section" aria-labelledby="run-inspector-decisions-heading">
-      <h3 id="run-inspector-decisions-heading">${t("activity.runInspector.decisions.heading")}</h3>
-      ${result.decisions.length === 0
-        ? html`<p>${t("activity.runInspector.decisions.none")}</p>`
-        : html`<p>
-            ${t("activity.runInspector.decisions.returned", {
-              count: String(result.decisions.length),
-            })}
-          </p>`}
-      ${result.nextDecisionCursor
-        ? html`<div class="run-inspector__pagination" role="note">
-            ${t("activity.runInspector.decisions.more")}
-          </div>`
-        : html`<div class="run-inspector__pagination" role="note">
-            ${t("activity.runInspector.decisions.bounded")}
-          </div>`}
-    </section>
-  `;
-}
-
-function diagnosticCopy(result: AuditRunInspectResult) {
+function diagnosticCopy(result: RunInspectorResult) {
   const kind = classifyRunInspection(result);
-  switch (kind) {
-    case "not-found":
-      return {
-        title: t("activity.runInspector.diagnostic.notFound.title"),
-        description: t("activity.runInspector.diagnostic.notFound.description"),
-      };
-    case "expired":
-      return {
-        title: t("activity.runInspector.diagnostic.expired.title"),
-        description: t("activity.runInspector.diagnostic.expired.description"),
-      };
-    case "corrupt":
-      return {
-        title: t("activity.runInspector.diagnostic.corrupt.title"),
-        description: t("activity.runInspector.diagnostic.corrupt.description"),
-      };
-    case "ambiguous":
-      return {
-        title: t("activity.runInspector.diagnostic.ambiguous.title"),
-        description: t("activity.runInspector.diagnostic.ambiguous.description"),
-      };
-    case "unsupported":
-      return {
-        title: t("activity.runInspector.diagnostic.unsupported.title"),
-        description: t("activity.runInspector.diagnostic.unsupported.description"),
-      };
-    case "unknown":
-      return {
-        title: t("activity.runInspector.diagnostic.unknown.title"),
-        description: t("activity.runInspector.diagnostic.unknown.description"),
-      };
-    case "present":
-      return null;
+  if (kind === "present") {
+    return null;
   }
-  const unreachable: never = kind;
-  return unreachable;
+  const key = kind === "not-found" ? "notFound" : kind;
+  return {
+    title: t(`activity.runInspector.diagnostic.${key}.title`),
+    description: t(`activity.runInspector.diagnostic.${key}.description`),
+  };
 }
 
 function renderUnavailableResult(
-  result: AuditRunInspectResult,
+  result: RunInspectorResult,
   basePath: string,
   executionPageStatus: "loading" | "error" | undefined,
   onLoadMoreExecutions: () => void,
@@ -452,64 +324,82 @@ function renderUnavailableResult(
       <h3>${copy.title}</h3>
       <p>${copy.description}</p>
       <p>
-        ${t("activity.runInspector.diagnosticReason")} ${renderSafeRef(identity.reasonCode, true)}
+        ${t("activity.runInspector.diagnosticReason")}
+        ${renderRunInspectorSafeRef(identity.reasonCode, true)}
       </p>
     </div>
-    ${identity.state === "ambiguous"
-      ? html`
-          <ol
-            class="run-inspector__candidate-list"
-            aria-label=${t("activity.runInspector.candidates.listLabel")}
-          >
-            ${identity.candidates.map(
-              (candidate) => html`
-                <li>
-                  <span
-                    >${t("activity.runInspector.candidates.recorded", {
-                      date: new Date(candidate.createdAt).toLocaleString(),
-                    })}</span
-                  >
-                  <a href=${executionInspectorHref(candidate.executionId, basePath)}>
-                    ${t("activity.runInspector.candidates.executionReference")}
-                    ${renderSafeRef(candidate.executionId, true)}
-                  </a>
-                </li>
-              `,
-            )}
-          </ol>
-          ${result.nextExecutionCursor
-            ? html`<div class="run-inspector__pagination">
-                <span>${t("activity.runInspector.candidates.more")}</span>
-                <button
-                  type="button"
-                  class="btn"
-                  ?disabled=${executionPageStatus === "loading"}
-                  @click=${onLoadMoreExecutions}
-                >
-                  ${executionPageStatus === "loading"
-                    ? t("activity.runInspector.candidates.loadingMore")
-                    : t("activity.runInspector.candidates.loadMore")}
-                </button>
-                ${executionPageStatus === "error"
-                  ? html`<span role="alert">
-                      ${t("activity.runInspector.candidates.loadMoreError")}
-                    </span>`
-                  : nothing}
-              </div>`
-            : nothing}
-        `
-      : nothing}
-    ${renderMissingEvidence(identity.missingEvidence)} ${renderRemediation(identity.remediation)}
+    ${
+      identity.state === "ambiguous"
+        ? html`
+            <ol
+              class="run-inspector__candidate-list"
+              aria-label=${t("activity.runInspector.candidates.listLabel")}
+            >
+              ${identity.candidates.map(
+                (candidate) => html`
+                  <li>
+                    <span
+                      >${t("activity.runInspector.candidates.recorded", {
+                        date: new Date(candidate.createdAt).toLocaleString(),
+                      })}</span
+                    >
+                    <a
+                      href=${activityRunInspectorSelectorHref(
+                        { kind: "execution", id: candidate.executionId },
+                        basePath,
+                      )}
+                    >
+                      ${t("activity.runInspector.candidates.executionReference")}
+                      ${renderRunInspectorSafeRef(candidate.executionId, true)}
+                    </a>
+                  </li>
+                `,
+              )}
+            </ol>
+            ${
+              result.nextExecutionCursor
+                ? html`<div class="run-inspector__pagination">
+                    <span>${t("activity.runInspector.candidates.more")}</span>
+                    <button
+                      type="button"
+                      class="btn"
+                      ?disabled=${executionPageStatus === "loading"}
+                      @click=${onLoadMoreExecutions}
+                    >
+                      ${
+                        executionPageStatus === "loading"
+                          ? t("activity.runInspector.candidates.loadingMore")
+                          : t("activity.runInspector.candidates.loadMore")
+                      }
+                    </button>
+                    ${
+                      executionPageStatus === "error"
+                        ? html`<span role="alert">
+                            ${t("activity.runInspector.candidates.loadMoreError")}
+                          </span>`
+                        : nothing
+                    }
+                  </div>`
+                : nothing
+            }
+          `
+        : nothing
+    }
+    ${renderRunInspectorMissingEvidence(identity.missingEvidence)}
+    ${renderRunInspectorRemediation(identity.remediation)}
   `;
 }
 
 function renderReady(
   state: Extract<RunInspectorState, { status: "ready" }>,
   basePath: string,
+  selector: RunInspectorSelector | null,
+  selectorId: string | null,
+  onLoadMoreDecisions: () => void,
   onLoadMoreExecutions: () => void,
 ) {
   const result = state.result;
-  const currentCoverageLabel = coverageLabel(result.coverage.state);
+  const currentCoverageLabel = runInspectorCoverageLabel(result.coverage.state);
   return html`
     <div
       class="run-inspector__coverage run-inspector__coverage--${result.coverage.state}"
@@ -520,97 +410,75 @@ function renderReady(
     >
       <strong>${currentCoverageLabel}</strong>
       <span>
-        ${t(`activity.runInspector.coverage.${coverageKey(result.coverage.state)}.description`)}
+        ${t(
+          `activity.runInspector.coverage.${runInspectorCoverageKey(result.coverage.state)}.description`,
+        )}
       </span>
     </div>
-    ${result.identity.state === "present"
-      ? html`
-          <section class="run-inspector__section" aria-labelledby="run-inspector-identity-heading">
-            <h3 id="run-inspector-identity-heading">
-              ${t("activity.runInspector.identityHeading")}
-            </h3>
-            <dl class="run-inspector__facts">
-              ${identityFacts(result.identity.context, basePath).map(renderFact)}
-            </dl>
-          </section>
-          ${renderMissingEvidence(result.coverage.missingEvidence)} ${renderDecisions(result)}
-        `
-      : renderUnavailableResult(result, basePath, state.executionPageStatus, onLoadMoreExecutions)}
+    ${
+      result.identity.state === "present"
+        ? html`
+            <section
+              class="run-inspector__section"
+              aria-labelledby="run-inspector-identity-heading"
+            >
+              <h3 id="run-inspector-identity-heading">
+                ${t("activity.runInspector.identityHeading")}
+              </h3>
+              <dl class="run-inspector__facts">
+                ${identityFacts(result.identity.context, basePath).map(renderFact)}
+              </dl>
+            </section>
+            ${renderRunInspectorMissingEvidence(result.coverage.missingEvidence)}
+            ${renderRunInspectorDecisions(state, selector, selectorId, basePath, onLoadMoreDecisions)}
+          `
+        : renderUnavailableResult(result, basePath, state.executionPageStatus, onLoadMoreExecutions)
+    }
   `;
 }
 
 function renderPanel(
-  title: string,
-  description: string,
-  options: { retry?: boolean; onRetry: () => void; role?: "alert" | "status" },
+  props: RunInspectorProps,
+  state: Exclude<RunInspectorState, { status: "ready" }>,
 ) {
+  const key = state.status === "loading" && state.waitingForGateway ? "waiting" : state.status;
+  const action =
+    state.status === "error"
+      ? state.recovery === "restart"
+        ? { label: t("activity.runInspector.restart"), onClick: props.onRestart }
+        : { label: t("activity.runInspector.retry"), onClick: props.onRetry }
+      : undefined;
   return html`
-    <div class="run-inspector__panel" role=${options.role ?? "status"}>
-      <h3>${title}</h3>
-      <p>${description}</p>
-      ${options.retry
-        ? html`<button type="button" class="btn" @click=${options.onRetry}>
-            ${t("activity.runInspector.retry")}
-          </button>`
-        : nothing}
+    <div
+      class="run-inspector__panel"
+      role=${state.status === "error" || state.status === "unauthorized" ? "alert" : "status"}
+    >
+      <h3>${t(`activity.runInspector.panels.${key}.title`)}</h3>
+      <p>${t(`activity.runInspector.panels.${key}.description`)}</p>
+      ${
+        action
+          ? html`<button type="button" class="btn" @click=${action.onClick}>
+              ${action.label}
+            </button>`
+          : nothing
+      }
     </div>
   `;
 }
 
 export function renderRunInspector(props: RunInspectorProps) {
   const state = props.state;
-  let content: TemplateResult;
-  switch (state.status) {
-    case "empty":
-      content = renderPanel(
-        t("activity.runInspector.panels.empty.title"),
-        t("activity.runInspector.panels.empty.description"),
-        { onRetry: props.onRetry },
-      );
-      break;
-    case "loading":
-      content = renderPanel(
-        state.waitingForGateway
-          ? t("activity.runInspector.panels.waiting.title")
-          : t("activity.runInspector.panels.loading.title"),
-        state.waitingForGateway
-          ? t("activity.runInspector.panels.waiting.description")
-          : t("activity.runInspector.panels.loading.description"),
-        { onRetry: props.onRetry },
-      );
-      break;
-    case "disconnected":
-      content = renderPanel(
-        t("activity.runInspector.panels.disconnected.title"),
-        t("activity.runInspector.panels.disconnected.description"),
-        { onRetry: props.onRetry },
-      );
-      break;
-    case "unauthorized":
-      content = renderPanel(
-        t("activity.runInspector.panels.unauthorized.title"),
-        t("activity.runInspector.panels.unauthorized.description"),
-        { onRetry: props.onRetry, role: "alert" },
-      );
-      break;
-    case "unsupported":
-      content = renderPanel(
-        t("activity.runInspector.panels.unsupported.title"),
-        t("activity.runInspector.panels.unsupported.description"),
-        { onRetry: props.onRetry },
-      );
-      break;
-    case "error":
-      content = renderPanel(
-        t("activity.runInspector.panels.error.title"),
-        t("activity.runInspector.panels.error.description"),
-        { onRetry: props.onRetry, retry: true, role: "alert" },
-      );
-      break;
-    case "ready":
-      content = renderReady(state, props.basePath, props.onLoadMoreExecutions);
-      break;
-  }
+  const content =
+    state.status === "ready"
+      ? renderReady(
+          state,
+          props.basePath,
+          props.selector,
+          props.selectorId,
+          props.onLoadMoreDecisions,
+          props.onLoadMoreExecutions,
+        )
+      : renderPanel(props, state);
 
   return html`
     <section

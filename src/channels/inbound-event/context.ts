@@ -23,6 +23,7 @@ import type { ContextVisibilityMode } from "../../config/types.base.js";
 import type { GroupToolPolicyConfig } from "../../config/types.tools.js";
 import type { PluginHookChannelContext } from "../../plugins/hook-channel-context.types.js";
 import { shouldIncludeSupplementalContext } from "../../security/context-visibility.js";
+import { copyConversationBindingRouteFacts } from "../conversation-binding-route-facts.js";
 import type { InboundImplicitMentionKind } from "../mention-gating.js";
 import type {
   ChannelIngressCommandAccess,
@@ -292,7 +293,7 @@ function resolveChannelInboundSupplementalForFinalizer(params: {
 
   const quote = filtered.quote as ChannelInboundSupplementalQuoteFacts;
   const selfQuote = quote.isSelf === true;
-  const suppressSelfQuoteBody = params.suppressSelfQuoteBody ?? true;
+  const suppressSelfQuoteBody = params.suppressSelfQuoteBody ?? false;
   const suppressSelfQuoteMedia = params.suppressSelfQuoteMedia ?? true;
   const finalizeQuote = (quoteMedia?: readonly InboundMediaFacts[] | null) => {
     if (!(selfQuote && suppressSelfQuoteMedia)) {
@@ -554,6 +555,7 @@ function buildChannelInboundEventContextValue(
     ReplyToIdFull: params.reply.replyToIdFull,
     ChatType: params.conversation.kind,
     ChatId: params.conversation.id,
+    ConversationRoutePeerId: params.conversation.routePeer?.id,
     ConversationLabel: params.conversation.label,
     GroupSubject: params.conversation.kind !== "direct" ? params.conversation.label : undefined,
     GroupSpace: params.conversation.spaceId,
@@ -562,6 +564,7 @@ function buildChannelInboundEventContextValue(
     SenderUsername: params.sender.username,
     SenderTag: params.sender.tag,
     SenderIsBot: params.sender.isBot,
+    SenderIsSelf: params.sender.isSelf === true ? true : undefined,
     MemberRoleIds: params.sender.roles,
     Timestamp: params.timestamp,
     Provider: params.provider ?? params.channel,
@@ -578,6 +581,7 @@ function buildChannelInboundEventContextValue(
     CommandTurn: commandTurn,
     MessageThreadId: params.reply.messageThreadId ?? params.conversation.threadId,
     NativeChannelId: params.reply.nativeChannelId ?? params.conversation.nativeChannelId,
+    ConversationAvatar: params.conversation.avatar,
     ChannelContext: params.channelContext,
     OriginatingChannel: params.channel,
     OriginatingTo: params.reply.originatingTo ?? params.reply.to,
@@ -585,8 +589,10 @@ function buildChannelInboundEventContextValue(
     // This builder is the post-admission boundary for channel events. Preserve
     // that fact so interceptors cannot bypass sender, route, or pairing gates.
     InboundAccessAuthorized: true,
+    ConversationRouteContextObserved: params.conversation.routePeer ? true : undefined,
     ...params.extra,
   };
+  copyConversationBindingRouteFacts(params.route, context);
   const finalizeParams = {
     finalize: params.finalize,
     finalizeOptions: params.finalizeOptions,

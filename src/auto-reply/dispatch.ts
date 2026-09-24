@@ -20,10 +20,15 @@ import {
   resolveCommandTurnContext,
   resolveCommandTurnTargetSessionKey,
 } from "./command-turn-context.js";
+import { isActiveRunSafeCommandTurn } from "./commands-registry.js";
 import { withReplyDispatcher } from "./dispatch-dispatcher.js";
+import { dispatchGroupThread } from "./group-thread-dispatch.js";
 import type { CommandSessionMetadataChange } from "./reply/command-session-metadata.js";
 import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
-import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.types.js";
+import type {
+  DispatchFromConfigResult,
+  DispatchReplyFromConfig,
+} from "./reply/dispatch-from-config.types.js";
 import type {
   InternalGetReplyFromConfig,
   InternalGetReplyOptions,
@@ -39,9 +44,17 @@ import {
   type ReplyDispatcherWithTypingOptions,
 } from "./reply/reply-dispatcher.js";
 import type { ReplyDispatcher } from "./reply/reply-dispatcher.types.js";
+import {
+  REPLY_OPERATION_RUN_STATE,
+  resolveReplyOperationRunState,
+  type ReplyOperationRunState,
+} from "./reply/reply-operation-run-state.js";
 import type { FinalizedMsgContext, MsgContext } from "./templating.js";
 
-type InternalDispatchReplyOptions = Omit<InternalGetReplyOptions, "onBlockReply">;
+type InternalDispatchReplyOptions = Omit<
+  InternalGetReplyOptions,
+  "onBlockReply" | "onPreparedBlockReply"
+>;
 
 type ReplyPayloadRunState = {
   runId?: string;
@@ -92,7 +105,21 @@ function resolveForegroundReplyOrderKey(finalized: FinalizedMsgContext): string 
   ]);
 }
 
-function reserveForegroundReplyLease(finalized: FinalizedMsgContext): KeyedFifoLease | undefined {
+function reserveForegroundReplyLease(
+  finalized: FinalizedMsgContext,
+  cfg: OpenClawConfig,
+): KeyedFifoLease | undefined {
+  // Inspection/control commands are allowed beside an active run. They must
+  // not take a FIFO slot behind that run or /status stays silent until it ends.
+  if (
+    isActiveRunSafeCommandTurn({
+      commandTurn: resolveCommandTurnContext(finalized),
+      cfg,
+      provider: finalized.Provider ?? finalized.Surface,
+    })
+  ) {
+    return undefined;
+  }
   const key = resolveForegroundReplyOrderKey(finalized);
   return key ? foregroundReplyLeases.reserve([key]) : undefined;
 }
@@ -142,9 +169,9 @@ function bindReplyPayloadRunState(
   const onAgentRunStart = replyOptions?.onAgentRunStart;
   return {
     ...replyOptions,
-    onAgentRunStart: (runId) => {
-      runState.runId = runId;
-      onAgentRunStart?.(runId);
+    onAgentRunStart: (...args) => {
+      runState.runId = args[0];
+      return onAgentRunStart?.(...args);
     },
   };
 }
@@ -190,46 +217,7 @@ function buildDispatchTimelineAttributes(ctx: MsgContext | FinalizedMsgContext) 
 }
 
 type DispatchInboundResult = DispatchFromConfigResult;
-export { settleReplyDispatcher, withReplyDispatcher } from "./dispatch-dispatcher.js";
-
-function finalizeDispatchResult(
-  result: DispatchFromConfigResult,
-  dispatcher: ReplyDispatcher,
-): DispatchFromConfigResult {
-  const cancelledCounts = dispatcher.getCancelledCounts?.();
-  const failedCounts = dispatcher.getFailedCounts?.();
-  if (!cancelledCounts && !failedCounts) {
-    return result;
-  }
-
-  const resultCounts = {
-    tool: result.counts?.tool ?? 0,
-    block: result.counts?.block ?? 0,
-    final: result.counts?.final ?? 0,
-  };
-  // Dispatcher counts include cancelled/failed queued blocks; public result counts do not.
-  const counts = {
-    tool: Math.max(0, resultCounts.tool - (cancelledCounts?.tool ?? 0) - (failedCounts?.tool ?? 0)),
-    block: Math.max(
-      0,
-      resultCounts.block - (cancelledCounts?.block ?? 0) - (failedCounts?.block ?? 0),
-    ),
-    final: Math.max(
-      0,
-      resultCounts.final - (cancelledCounts?.final ?? 0) - (failedCounts?.final ?? 0),
-    ),
-  };
-  const hasFailedCounts =
-    (failedCounts?.tool ?? 0) > 0 ||
-    (failedCounts?.block ?? 0) > 0 ||
-    (failedCounts?.final ?? 0) > 0;
-  return {
-    ...result,
-    queuedFinal: result.queuedFinal && counts.final > 0,
-    counts,
-    ...(hasFailedCounts ? { failedCounts } : {}),
-  };
-}
+export { settleReplyDispatcher } from "./dispatch-dispatcher.js";
 
 /** Dispatches one finalized inbound message through reply resolution and queued delivery. */
 export async function dispatchInboundMessage(params: {
@@ -239,6 +227,7 @@ export async function dispatchInboundMessage(params: {
   toolsAllow?: string[];
   replyOptions?: InternalDispatchReplyOptions;
   replyResolver?: InternalGetReplyFromConfig;
+  dispatchReplyFromConfig?: DispatchReplyFromConfig;
   onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
   replyPayloadRunState?: ReplyPayloadRunState;
   /** Observe-only turns run the agent without entering outbound hook stages. */
@@ -271,40 +260,43 @@ export async function dispatchInboundMessage(params: {
   if (params.outboundHooks !== "disabled") {
     installReplyPayloadSendingBeforeDeliver(params.dispatcher, finalized, replyPayloadRunState);
   }
+  let settledReceipt: DispatchFromConfigResult["settledReceipt"];
   const result = await withReplyDispatcher({
     dispatcher: params.dispatcher,
     onSettled: params.onSettled,
     run: () =>
       measureDiagnosticsTimelineSpan(
         "auto_reply.dispatch_reply_from_config",
-        () =>
-          dispatchReplyFromConfig({
+        async () => {
+          const dispatch = params.dispatchReplyFromConfig ?? dispatchReplyFromConfig;
+          const request = {
             ctx: finalized,
             cfg: params.cfg,
             dispatcher: params.dispatcher,
             replyOptions: replyOptionsWithRunState,
             replyResolver: params.replyResolver,
             onSessionMetadataChanges: params.onSessionMetadataChanges,
-            usePublishedModelRuntime: true,
-          }),
+          };
+          return (await dispatchGroupThread(request, dispatch)) ?? (await dispatch(request));
+        },
         {
           phase: "agent-turn",
           config: params.cfg,
           attributes: buildDispatchTimelineAttributes(finalized),
         },
       ),
+    onSettledReceipt: (receipt) => {
+      settledReceipt = receipt;
+    },
   });
-  return finalizeDispatchResult(result, params.dispatcher);
+  return settledReceipt ? { ...result, settledReceipt } : result;
 }
 
-type BufferedInboundDispatcherParams = {
-  ctx: MsgContext | FinalizedMsgContext;
-  cfg: OpenClawConfig;
+type BufferedInboundDispatcherParams = Omit<
+  Parameters<typeof dispatchInboundMessage>[0],
+  "dispatcher" | "replyPayloadRunState" | "outboundHooks" | "onSettled"
+> & {
   dispatcherOptions: ReplyDispatcherWithTypingOptions;
-  toolsAllow?: string[];
-  replyOptions?: InternalDispatchReplyOptions;
-  replyResolver?: InternalGetReplyFromConfig;
-  onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
 };
 
 async function dispatchInboundMessageWithBufferedDispatcherCore(
@@ -316,11 +308,22 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
   },
 ): Promise<DispatchInboundResult> {
   const finalized = finalizeInboundContext(params.ctx);
-  const foregroundReplyLease = reserveForegroundReplyLease(finalized);
+  const foregroundReplyLease = reserveForegroundReplyLease(finalized, params.cfg);
+  const replyOperationRunState: ReplyOperationRunState =
+    resolveReplyOperationRunState(params.replyOptions) ?? {};
   const silentReplyContext = resolveDispatcherSilentReplyContext(finalized, params.cfg);
   const replyPayloadRunState = {
     runId: params.replyOptions?.runId,
   };
+  let settledDeliveries = Promise.resolve();
+  const settleDeliveries = () =>
+    (settledDeliveries = settledDeliveries.then(() =>
+      runOrderedForegroundReplySettledDeliveries(
+        replyOperationRunState.questionInputHandled ? undefined : foregroundReplyLease,
+        params.dispatcherOptions.onSettled,
+        params.dispatcherOptions.onFreshSettledDelivery,
+      ),
+    ));
   const replyPayloadBeforeDeliver =
     ownership.outboundHooks === "disabled"
       ? undefined
@@ -348,7 +351,10 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
   const beforeDeliver: ReplyDispatchBeforeDeliver | undefined =
     foregroundReplyLease || configuredBeforeDeliver
       ? markReplyDispatchBeforeDeliverDeadlineOwned(async (payload, info) => {
-          await foregroundReplyLease?.wait();
+          // A question response must not wait behind the turn waiting for that response.
+          if (!replyOperationRunState.questionInputHandled) {
+            await foregroundReplyLease?.wait();
+          }
           return configuredBeforeDeliver ? await configuredBeforeDeliver(payload, info) : payload;
         })
       : undefined;
@@ -356,6 +362,8 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
     createReplyDispatcherWithTyping({
       ...params.dispatcherOptions,
       beforeDeliver,
+      onSettled: settleDeliveries,
+      onFreshSettledDelivery: undefined,
       silentReplyContext: params.dispatcherOptions.silentReplyContext ?? silentReplyContext,
     });
   const onTypingController = params.replyOptions?.onTypingController
@@ -372,10 +380,12 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
       dispatcher,
       toolsAllow: params.toolsAllow,
       replyResolver: params.replyResolver,
+      dispatchReplyFromConfig: params.dispatchReplyFromConfig,
       replyOptions: {
         ...params.replyOptions,
         ...replyOptions,
         onTypingController,
+        [REPLY_OPERATION_RUN_STATE]: replyOperationRunState,
       },
       replyPayloadRunState,
       outboundHooks: ownership.outboundHooks,
@@ -383,11 +393,7 @@ async function dispatchInboundMessageWithBufferedDispatcherCore(
     });
   } finally {
     try {
-      await runOrderedForegroundReplySettledDeliveries(
-        foregroundReplyLease,
-        params.dispatcherOptions.onSettled,
-        params.dispatcherOptions.onFreshSettledDelivery,
-      );
+      await settledDeliveries;
     } finally {
       foregroundReplyLease?.release();
       markRunComplete();
@@ -419,14 +425,11 @@ export async function dispatchInboundMessageWithRoutedChannelDispatcher(
   });
 }
 
-type PlainInboundDispatcherParams = {
-  ctx: MsgContext | FinalizedMsgContext;
-  cfg: OpenClawConfig;
+type PlainInboundDispatcherParams = Omit<
+  BufferedInboundDispatcherParams,
+  "dispatcherOptions" | "dispatchReplyFromConfig"
+> & {
   dispatcherOptions: ReplyDispatcherOptions;
-  toolsAllow?: string[];
-  replyOptions?: InternalDispatchReplyOptions;
-  replyResolver?: InternalGetReplyFromConfig;
-  onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
 };
 
 async function dispatchInboundMessageWithPlainDispatcherCore(
@@ -477,28 +480,19 @@ async function dispatchInboundMessageWithPlainDispatcherCore(
 }
 
 /** Creates a plain dispatcher, installs global send hooks, and dispatches the inbound message. */
-export async function dispatchInboundMessageWithDispatcher(params: {
-  ctx: MsgContext | FinalizedMsgContext;
-  cfg: OpenClawConfig;
-  dispatcherOptions: ReplyDispatcherOptions;
-  toolsAllow?: string[];
-  replyOptions?: InternalDispatchReplyOptions;
-  replyResolver?: InternalGetReplyFromConfig;
-}): Promise<DispatchInboundResult> {
+export async function dispatchInboundMessageWithDispatcher(
+  params: Omit<PlainInboundDispatcherParams, "onSessionMetadataChanges">,
+): Promise<DispatchInboundResult> {
   return await dispatchInboundMessageWithPlainDispatcherCore(params, "legacy");
 }
 
 type ProjectedOptions = Omit<ReplyDispatcherOptions, "beforeDeliver" | "beforeDeliverOptions">;
 
 /** Creates a core-owned dispatcher whose modifiers fence projected output capture. */
-export async function dispatchInboundMessageWithProjectedDispatcher(params: {
-  ctx: MsgContext | FinalizedMsgContext;
-  cfg: OpenClawConfig;
-  dispatcherOptions: ProjectedOptions;
-  toolsAllow?: string[];
-  replyOptions?: InternalDispatchReplyOptions;
-  replyResolver?: InternalGetReplyFromConfig;
-  onSessionMetadataChanges?: (changes: CommandSessionMetadataChange[]) => void;
-}): Promise<DispatchInboundResult> {
+export async function dispatchInboundMessageWithProjectedDispatcher(
+  params: Omit<PlainInboundDispatcherParams, "dispatcherOptions"> & {
+    dispatcherOptions: ProjectedOptions;
+  },
+): Promise<DispatchInboundResult> {
   return await dispatchInboundMessageWithPlainDispatcherCore(params, "projected");
 }

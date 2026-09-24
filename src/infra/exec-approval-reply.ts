@@ -14,6 +14,8 @@ import { formatHumanList } from "../shared/human-list.js";
 // Builds reply payloads for exec approval prompts and outcomes.
 import { formatFencedCodeBlock } from "../shared/markdown-code.js";
 import { formatApprovalDisplayPath } from "./approval-display-paths.js";
+import { summarizeApprovalScope, type ApprovalScope } from "./approval-scope.js";
+import type { ChannelApprovalKind } from "./approval-types.js";
 import {
   describeNativeExecApprovalClientSetup,
   listNativeExecApprovalClientLabels,
@@ -34,7 +36,7 @@ export type ExecApprovalUnavailableReason =
 export type ExecApprovalReplyMetadata = {
   approvalId: string;
   approvalSlug: string;
-  approvalKind: "exec" | "plugin";
+  approvalKind: ChannelApprovalKind;
   agentId?: string;
   allowedDecisions?: readonly ExecApprovalReplyDecision[];
   sessionKey?: string;
@@ -67,6 +69,7 @@ export type ExecApprovalPendingReplyParams = {
   cwd?: string;
   host: ExecHost;
   nodeId?: string;
+  scope?: ApprovalScope | null;
   sessionKey?: string | null;
   expiresAtMs?: number;
   nowMs?: number;
@@ -146,48 +149,22 @@ function buildApprovalActionDescriptors(
   approvalCommandId: string,
   allowedDecisions: readonly ExecApprovalReplyDecision[],
 ): ExecApprovalActionDescriptor[] {
-  const descriptors: ExecApprovalActionDescriptor[] = [];
-  const buildDescriptor = (descriptor: {
-    decision: ExecApprovalReplyDecision;
-    label: string;
-    style: ExecApprovalActionDescriptor["style"];
-  }): ExecApprovalActionDescriptor => {
-    return {
-      ...descriptor,
+  const decisions: Pick<ExecApprovalActionDescriptor, "decision" | "label" | "style">[] = [
+    { decision: "allow-once", label: "Allow Once", style: "success" },
+    { decision: "allow-always", label: "Allow Always", style: "primary" },
+    { decision: "deny", label: "Deny", style: "danger" },
+  ];
+  return decisions
+    .filter((descriptor) => allowedDecisions.includes(descriptor.decision))
+    .map((descriptor) => ({
+      decision: descriptor.decision,
+      label: descriptor.label,
+      style: descriptor.style,
       command: buildExecApprovalCommandText({
         approvalCommandId,
         decision: descriptor.decision,
       }),
-    };
-  };
-  if (allowedDecisions.includes("allow-once")) {
-    descriptors.push(
-      buildDescriptor({
-        decision: "allow-once",
-        label: "Allow Once",
-        style: "success",
-      }),
-    );
-  }
-  if (allowedDecisions.includes("allow-always")) {
-    descriptors.push(
-      buildDescriptor({
-        decision: "allow-always",
-        label: "Allow Always",
-        style: "primary",
-      }),
-    );
-  }
-  if (allowedDecisions.includes("deny")) {
-    descriptors.push(
-      buildDescriptor({
-        decision: "deny",
-        label: "Deny",
-        style: "danger",
-      }),
-    );
-  }
-  return descriptors;
+    }));
 }
 
 export function buildExecApprovalActionDescriptors(
@@ -202,7 +179,7 @@ export function buildExecApprovalActionDescriptors(
 /** Build approval descriptors with explicit owner-aware typed actions. */
 export function buildTypedApprovalActionDescriptors(
   params: BuildExecApprovalActionDescriptorsParams & {
-    approvalKind: "exec" | "plugin";
+    approvalKind: ChannelApprovalKind;
   },
 ): TypedApprovalActionDescriptor[] {
   const approvalId = params.approvalCommandId;
@@ -272,7 +249,7 @@ export function buildApprovalButtonPresentation(
 
 /** Build portable approval controls with explicit owner-aware typed actions. */
 export function buildTypedApprovalPresentation(
-  params: BuildApprovalPresentationParams & { approvalKind: "exec" | "plugin" },
+  params: BuildApprovalPresentationParams & { approvalKind: ChannelApprovalKind },
 ): MessagePresentation | undefined {
   return buildApprovalPresentationFromActionDescriptors(
     buildTypedApprovalActionDescriptors({
@@ -429,6 +406,9 @@ export function buildExecApprovalPendingReplyPayload(
   }
   if (params.cwd) {
     info.push(`CWD: ${formatApprovalDisplayPath(params.cwd)}`);
+  }
+  if (params.scope) {
+    info.push(`Scope: ${summarizeApprovalScope(params.scope)}`);
   }
   if (typeof params.expiresAtMs === "number" && Number.isFinite(params.expiresAtMs)) {
     info.push(

@@ -13,6 +13,10 @@ import type { PollInput } from "../../polls.js";
 /** Delivery durability requested by core when a channel sends agent output. */
 export type MessageDurabilityPolicy = "required" | "best_effort" | "disabled";
 
+export type OutboundReplyFacts =
+  | Readonly<{ source: "explicit"; replyToId: string }>
+  | Readonly<{ source: "implicit"; replyToId: string; mode: "first" | "all" }>;
+
 /** Capability names a channel must advertise before core can rely on durable final delivery. */
 export const durableFinalDeliveryCapabilities = [
   "text",
@@ -48,8 +52,14 @@ type DurableFinalDeliveryPayloadShape = {
 
 /** Raw platform result shape normalized into a message receipt. */
 export type MessageReceiptSourceResult = {
+  /** Provider-confirmed intentional omission before dispatch, never an ambiguous send. */
+  outcome?: "not_sent";
   channel?: string;
   messageId?: string;
+  target?: {
+    kind: "chat" | "channel" | "room" | "conversation";
+    id: string;
+  };
   chatId?: string;
   channelId?: string;
   roomId?: string;
@@ -189,6 +199,8 @@ export type ChannelMessageSendTextContext<TConfig = OpenClawConfig> = {
   preparedMessageId?: string;
   /** @internal Refresh durable timing before recipient-visible or finalizing platform I/O. */
   onPlatformSendDispatch?: () => Promise<void>;
+  /** @internal Synchronously fence custody after refresh and immediately before provider I/O. */
+  assertDirectAdapterHandoff?: () => void;
   /** @internal Report each completed platform sub-send before another fallible step. */
   onDeliveryResult?: (result: ChannelMessageSendResult) => Promise<void> | void;
 };
@@ -206,17 +218,13 @@ export type ChannelMessageSendMediaContext<TConfig = OpenClawConfig> =
   };
 
 /** Rich reply payload send context used when adapters can consume structured payloads. */
-export type ChannelMessageSendPayloadContext<TConfig = OpenClawConfig> =
-  ChannelMessageSendTextContext<TConfig> & {
-    payload: ReplyPayload;
-    mediaUrl?: string;
-    mediaAccess?: OutboundMediaAccess;
-    mediaLocalRoots?: readonly string[];
-    mediaReadFile?: (filePath: string) => Promise<Buffer>;
-    audioAsVoice?: boolean;
-    gifPlayback?: boolean;
-    forceDocument?: boolean;
-  };
+export type ChannelMessageSendPayloadContext<TConfig = OpenClawConfig> = Omit<
+  ChannelMessageSendMediaContext<TConfig>,
+  "mediaUrl"
+> & {
+  payload: ReplyPayload;
+  mediaUrl?: string;
+};
 
 /** Poll send context; thread ids stay string-like because poll APIs do not accept numeric ids. */
 export type ChannelMessageSendPollContext<TConfig = OpenClawConfig> = Omit<
@@ -230,8 +238,10 @@ export type ChannelMessageSendPollContext<TConfig = OpenClawConfig> = Omit<
 
 /** Adapter send result normalized to a receipt plus optional legacy message id. */
 export type ChannelMessageSendResult = {
+  outcome?: MessageReceiptSourceResult["outcome"];
   receipt: MessageReceipt;
   messageId?: string;
+  target?: MessageReceiptSourceResult["target"];
 };
 
 /** Discriminator for lifecycle hooks around a concrete adapter send attempt. */
@@ -328,7 +338,7 @@ export type ChannelMessageDeferredDeliveryAdmissionContext<TConfig = OpenClawCon
 };
 
 /** Optional hooks around adapter send attempts, platform success/failure, and commit. */
-export type ChannelMessageSendLifecycleAdapter<
+type ChannelMessageSendLifecycleAdapter<
   TConfig = OpenClawConfig,
   TSendResult extends ChannelMessageSendResult = ChannelMessageSendResult,
 > = {
@@ -379,12 +389,7 @@ export type ChannelMessageDurableFinalAdapter = {
 };
 
 /** Live-message feature key declared by adapters that support preview or streaming behavior. */
-export type ChannelMessageLiveCapability =
-  | "draftPreview"
-  | "previewFinalization"
-  | "progressUpdates"
-  | "nativeStreaming"
-  | "quietFinalization";
+export type ChannelMessageLiveCapability = (typeof channelMessageLiveCapabilities)[number];
 
 /** Canonical ordered list of live-message feature keys. */
 export const channelMessageLiveCapabilities = [
@@ -393,7 +398,7 @@ export const channelMessageLiveCapabilities = [
   "progressUpdates",
   "nativeStreaming",
   "quietFinalization",
-] as const satisfies readonly ChannelMessageLiveCapability[];
+] as const;
 
 /** Capability keys for turning a preview into a final platform message. */
 export const livePreviewFinalizerCapabilities = [
@@ -424,11 +429,7 @@ export type ChannelMessageLiveAdapterShape = {
 };
 
 /** Receive acknowledgement timing policy for durable inbound message records. */
-export type ChannelMessageReceiveAckPolicy =
-  | "after_receive_record"
-  | "after_agent_dispatch"
-  | "after_durable_send"
-  | "manual";
+export type ChannelMessageReceiveAckPolicy = (typeof channelMessageReceiveAckPolicies)[number];
 
 /** Canonical ordered list of receive acknowledgement policies. */
 export const channelMessageReceiveAckPolicies = [
@@ -436,7 +437,7 @@ export const channelMessageReceiveAckPolicies = [
   "after_agent_dispatch",
   "after_durable_send",
   "manual",
-] as const satisfies readonly ChannelMessageReceiveAckPolicy[];
+] as const;
 
 /** Adapter receive shape for default and supported inbound acknowledgement policies. */
 export type ChannelMessageReceiveAdapterShape = {
@@ -461,9 +462,6 @@ export type ChannelMessageAdapter<
   TAdapter extends ChannelMessageAdapterShape = ChannelMessageAdapterShape,
 > = TAdapter;
 
-/** Extra durable-final requirement map for caller-derived capability checks. */
-type DurableFinalRequirementExtras = DurableFinalDeliveryRequirementMap;
-
 /** Inputs used to derive durable final-delivery requirements for a planned send. */
 export type DeriveDurableFinalDeliveryRequirementsParams = {
   payload: DurableFinalDeliveryPayloadShape;
@@ -476,7 +474,7 @@ export type DeriveDurableFinalDeliveryRequirementsParams = {
   reconcileUnknownSend?: boolean;
   afterSendSuccess?: boolean;
   afterCommit?: boolean;
-  extraCapabilities?: DurableFinalRequirementExtras;
+  extraCapabilities?: DurableFinalDeliveryRequirementMap;
 };
 
 /** Stable intent record for a durable outbound message send. */

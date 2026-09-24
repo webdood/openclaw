@@ -1,7 +1,7 @@
-// Whatsapp plugin module implements auth store behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { formatCliCommand } from "openclaw/plugin-sdk/cli-runtime";
+import { isPathStrictlyInside } from "openclaw/plugin-sdk/file-access-runtime";
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/routing";
 import {
   info,
@@ -95,11 +95,7 @@ export async function restoreCredsFromBackupIfNeeded(
   try {
     const credsPath = resolveWebCredsPath(authDir);
     const backupPath = resolveWebCredsBackupPath(authDir);
-    try {
-      await assertWebCredsPathRegularFileOrMissing(credsPath);
-    } catch {
-      return false;
-    }
+    await assertWebCredsPathRegularFileOrMissing(credsPath);
     const raw = readCredsJsonRaw(credsPath);
     if (raw && isValidJson(raw)) {
       return false;
@@ -136,25 +132,7 @@ export async function webAuthExists(authDir: string = resolveDefaultWebAuthDir()
   const resolvedAuthDir = resolveUserPath(authDir);
   const credsPath = resolveWebCredsPath(resolvedAuthDir);
   const raw = await readWebCredsJsonRaw(credsPath);
-  if (!raw) {
-    return false;
-  }
-  try {
-    JSON.parse(raw);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function resolveWebAuthState(params: {
-  linked: boolean;
-  barrierResult: CredsQueueWaitResult;
-}): WhatsAppWebAuthState {
-  if (params.barrierResult === "timed_out") {
-    return "unstable";
-  }
-  return params.linked ? "linked" : "not-linked";
+  return raw !== null && isValidJson(raw);
 }
 
 async function readWebAuthStateCore(
@@ -167,7 +145,7 @@ async function readWebAuthStateCore(
   return {
     authDir: resolvedAuthDir,
     linked,
-    state: resolveWebAuthState({ linked, barrierResult }),
+    state: barrierResult === "timed_out" ? "unstable" : linked ? "linked" : "not-linked",
   };
 }
 
@@ -284,11 +262,6 @@ async function shouldClearOnLogout(authDir: string, isLegacyAuthDir: boolean): P
   }
 }
 
-function isPathInsideDirectory(baseDir: string, targetPath: string): boolean {
-  const relativePath = path.relative(baseDir, targetPath);
-  return relativePath !== "" && !relativePath.startsWith("..") && !path.isAbsolute(relativePath);
-}
-
 async function pathHasSymlinkComponent(baseDir: string, targetPath: string): Promise<boolean> {
   const relativePath = path.relative(baseDir, targetPath);
   let currentPath = baseDir;
@@ -320,7 +293,7 @@ async function isLegacyWebAuthDir(authDir: string): Promise<boolean> {
 async function classifyWebAuthDirOwnership(authDir: string): Promise<WebAuthDirOwnership> {
   const whatsappAuthBase = path.resolve(resolveOAuthDir(), "whatsapp");
   const resolvedAuthDir = path.resolve(authDir);
-  if (!isPathInsideDirectory(whatsappAuthBase, resolvedAuthDir)) {
+  if (!isPathStrictlyInside(whatsappAuthBase, resolvedAuthDir)) {
     return { kind: "external" };
   }
 
@@ -331,7 +304,7 @@ async function classifyWebAuthDirOwnership(authDir: string): Promise<WebAuthDirO
   if (!baseRealPath || !authDirRealPath) {
     return { kind: "unsafe-owned" };
   }
-  if (!isPathInsideDirectory(baseRealPath, authDirRealPath)) {
+  if (!isPathStrictlyInside(baseRealPath, authDirRealPath)) {
     return { kind: "unsafe-owned" };
   }
   if (await pathHasSymlinkComponent(whatsappAuthBase, resolvedAuthDir)) {

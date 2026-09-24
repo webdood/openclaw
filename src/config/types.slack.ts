@@ -41,7 +41,7 @@ export type SlackChannelConfig = {
   /** Optional tool policy overrides for this channel. */
   tools?: GroupToolPolicyConfig;
   toolsBySender?: GroupToolPolicyBySenderConfig;
-  /** Allow bot-authored messages to trigger replies (default: false). Set to "mentions" to only allow bot messages that @mention this bot. */
+  /** Allow bot-authored messages to trigger replies (default: true). Set to "mentions" to only allow bot messages that @mention this bot. */
   allowBots?: boolean | "mentions";
   /** Sliding-window bot-pair loop guard for accepted bot-authored Slack messages. */
   botLoopProtection?: ChannelBotLoopProtectionConfig;
@@ -66,8 +66,11 @@ type SlackPresenceEventsConfig = {
 
 export type SlackReactionNotificationMode = "off" | "own" | "all" | "allowlist";
 export type SlackStreamingMode = "off" | "partial" | "block" | "progress";
+// DO NOT REMOVE OR CHANGE THE COMPACT STYLE WITHOUT APPROVAL FROM SJF OR PASHPASHPASH.
 export type SlackStreamingProgressConfig = ChannelStreamingProgressConfig & {
-  /** Opt in to Slack-native task cards for progress mode. Default: false. */
+  /** Slack progress presentation. "compact" keeps one editable text draft. Default: "card". */
+  style?: "card" | "compact";
+  /** Use Slack-native task cards for card-style progress. Default: true. */
   nativeTaskCards?: boolean;
 };
 export type SlackChannelStreamingConfig = ChannelStreamingConfig<SlackStreamingProgressConfig>;
@@ -126,6 +129,8 @@ export type SlackAccountConfig = Omit<
 > &
   ChannelBotInteractionConfig &
   ChannelReactionConfig<SlackReactionNotificationMode, never, string, true> & {
+    /** Post a room-specific introduction when joining a group. Default: true. */
+    joinIntro?: boolean;
     /** @deprecated Doctor-only legacy input. */
     identity?: "bot" | "user";
     /** @deprecated Doctor-only legacy input. */

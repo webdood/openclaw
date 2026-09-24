@@ -22,9 +22,8 @@ type McpLoopbackToolCallResult = {
 
 export type McpLoopbackToolCallStart = Pick<McpLoopbackToolCallResult, "toolName" | "args">;
 
-type McpLoopbackToolCallCapture = {
-  generation: number;
-  onYield?: (message: string) => Promise<void> | void;
+type McpLoopbackToolCallObservers = {
+  onYield?: (message: string, acknowledgment?: string) => Promise<void> | void;
   onRequestStart?: () => void;
   onRequestClassified?: () => void;
   onRequestFinish?: () => void;
@@ -35,6 +34,10 @@ type McpLoopbackToolCallCapture = {
   }) => void;
   onToolCallFinish?: (call: McpLoopbackToolCallStart, state: { prepared: boolean }) => void;
   onToolCallResult: (call: McpLoopbackToolCallResult) => void;
+};
+
+type McpLoopbackToolCallCapture = McpLoopbackToolCallObservers & {
+  generation: number;
   inFlight: number;
   activityVersion: number;
   activityWaiters: Set<() => void>;
@@ -86,20 +89,9 @@ function notifyMcpLoopbackToolCallCaptureActivity(capture: McpLoopbackToolCallCa
 }
 
 /** Start loopback tool-call result capture for one serialized CLI invocation. */
-export function beginMcpLoopbackToolCallCapture(params: {
-  captureKey: string;
-  onYield?: (message: string) => Promise<void> | void;
-  onRequestStart?: () => void;
-  onRequestClassified?: () => void;
-  onRequestFinish?: () => void;
-  onToolCallStart?: (call: McpLoopbackToolCallStart) => string | void;
-  onToolCallUpdate?: (calls: {
-    previous: McpLoopbackToolCallStart;
-    current: McpLoopbackToolCallStart;
-  }) => void;
-  onToolCallFinish?: (call: McpLoopbackToolCallStart, state: { prepared: boolean }) => void;
-  onToolCallResult: (call: McpLoopbackToolCallResult) => void;
-}): void {
+export function beginMcpLoopbackToolCallCapture(
+  params: McpLoopbackToolCallObservers & { captureKey: string },
+): void {
   const captureKey = params.captureKey.trim();
   if (!captureKey) {
     return;
@@ -124,15 +116,20 @@ export function beginMcpLoopbackToolCallCapture(params: {
 /** Resolve yield state bound to the request's admitted CLI capture generation. */
 export function resolveMcpLoopbackYieldContext(
   captureHandle: McpLoopbackRequestCaptureHandle | undefined,
-): { cacheKey: string; onYield: (message: string) => Promise<void> } | undefined {
+):
+  | {
+      cacheKey: string;
+      onYield: (message: string, acknowledgment?: string) => Promise<void>;
+    }
+  | undefined {
   const capture = captureHandle?.capture;
   if (!capture?.onYield) {
     return undefined;
   }
   return {
     cacheKey: String(capture.generation),
-    onYield: async (message: string) => {
-      await capture.onYield?.(message);
+    onYield: async (message: string, acknowledgment?: string) => {
+      await capture.onYield?.(message, acknowledgment);
     },
   };
 }
@@ -352,7 +349,7 @@ export async function waitForMcpLoopbackToolCallCaptureIdle(
   return true;
 }
 
-/** Clear an unfinished invocation capture. Attempt keys are unique per CLI execution. */
+/** Clear observers for this capture key. Grant admission is fenced separately. */
 export function clearMcpLoopbackToolCallCapture(captureKey: string): void {
   deleteMcpLoopbackToolCallCapture(captureKey.trim());
 }
