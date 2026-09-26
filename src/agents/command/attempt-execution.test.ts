@@ -375,6 +375,15 @@ describe("sessionTranscriptHasContent", () => {
 });
 
 describe("claudeCliSessionTranscriptPath", () => {
+  beforeEach(() => {
+    // A relocated Claude config on the test host must not leak into path expectations.
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("returns null for malformed session ids", () => {
     expect(
       claudeCliSessionTranscriptPath({
@@ -410,6 +419,9 @@ describe("claudeCliSessionTranscriptPath", () => {
   });
 
   it("uses the canonical Claude project dir resolver", () => {
+    // Keys follow path.resolve, so Windows prefixes the current drive letter.
+    const projectKey = (workspaceDir: string) =>
+      path.resolve(workspaceDir).replace(/[^a-zA-Z0-9]/g, "-");
     expect(
       claudeCliSessionTranscriptPath({
         sessionId: "11111111-2222-3333-4444-555555555555",
@@ -421,9 +433,12 @@ describe("claudeCliSessionTranscriptPath", () => {
         "/home/faris",
         ".claude",
         "projects",
-        "-home-faris--openclaw-workspace",
+        projectKey("/home/faris/.openclaw/workspace"),
         "11111111-2222-3333-4444-555555555555.jsonl",
       ),
+    );
+    expect(projectKey("/home/faris/.openclaw/workspace")).toMatch(
+      /-home-faris--openclaw-workspace$/,
     );
     expect(
       claudeCliSessionTranscriptPath({
@@ -431,10 +446,18 @@ describe("claudeCliSessionTranscriptPath", () => {
         workspaceDir: "/tmp/foo_bar.baz",
         homeDir: "/home/x",
       }),
-    ).toBe(path.join("/home/x", ".claude", "projects", "-tmp-foo-bar-baz", "session-x.jsonl"));
+    ).toBe(
+      path.join(
+        "/home/x",
+        ".claude",
+        "projects",
+        projectKey("/tmp/foo_bar.baz"),
+        "session-x.jsonl",
+      ),
+    );
   });
 
-  it("canonicalizes symlinked workspaces before resolving the Claude project dir", async () => {
+  it("keys symlinked workspaces the way Claude CLI observes its cwd", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "oc-claude-project-link-"));
     try {
       const workspaceDir = path.join(root, "workspace");
@@ -442,6 +465,8 @@ describe("claudeCliSessionTranscriptPath", () => {
       await fs.mkdir(workspaceDir);
       await fs.symlink(workspaceDir, linkDir, "dir");
 
+      // POSIX hands the CLI a resolved cwd; Windows keeps the junction spelling.
+      const observedByCli = process.platform === "win32" ? linkDir : workspaceDir;
       expect(
         claudeCliSessionTranscriptPath({
           sessionId: "session-link",
@@ -450,13 +475,42 @@ describe("claudeCliSessionTranscriptPath", () => {
         }),
       ).toBe(
         path.join(
-          resolveClaudeCliProjectDirForWorkspace({ workspaceDir, homeDir: root }),
+          resolveClaudeCliProjectDirForWorkspace({
+            workspaceDir: observedByCli,
+            homeDir: root,
+          }),
           "session-link.jsonl",
         ),
       );
+      if (process.platform === "win32") {
+        expect(
+          resolveClaudeCliProjectDirForWorkspace({ workspaceDir: linkDir, homeDir: root }),
+        ).not.toBe(resolveClaudeCliProjectDirForWorkspace({ workspaceDir, homeDir: root }));
+      }
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("stores project state under CLAUDE_CONFIG_DIR when Claude CLI is relocated", () => {
+    const configDir = path.join(os.tmpdir(), "relocated-claude-config");
+    const workspaceDir = path.join(os.tmpdir(), "ws");
+    // Windows resolves POSIX-looking paths onto a drive letter; key the same way.
+    const projectKey = path.resolve(workspaceDir).replace(/[^a-zA-Z0-9]/g, "-");
+    expect(
+      resolveClaudeCliProjectDirForWorkspace({
+        workspaceDir,
+        homeDir: "/home/x",
+        env: { CLAUDE_CONFIG_DIR: configDir },
+      }),
+    ).toBe(path.join(path.resolve(configDir), "projects", projectKey));
+    expect(
+      resolveClaudeCliProjectDirForWorkspace({
+        workspaceDir,
+        homeDir: "/home/x",
+        env: { CLAUDE_CONFIG_DIR: "  " },
+      }),
+    ).toBe(path.join("/home/x", ".claude", "projects", projectKey));
   });
 });
 

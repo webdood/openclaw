@@ -142,6 +142,7 @@ function resolveClaudeCliWorkspaceTargets(params: {
       const projectDir = resolveClaudeCliProjectDirForWorkspace({
         workspaceDir,
         homeDir: params.homeDir,
+        env: params.env,
       });
       return {
         agentId,
