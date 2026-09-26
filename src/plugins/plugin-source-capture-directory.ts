@@ -203,12 +203,15 @@ function createCaptureDirectory(instance: Instance, stateDir: string, prefix: st
       } else {
         const parent = instanceDirectory(stateDir);
         fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
-        instance.managedRoot = fs.realpathSync(parent);
+        // Native realpath: on Windows the JS realpath returns a junction target in its
+        // stored spelling (e.g. lowercase "C:\openclaw"), which never matches the
+        // fs-safe canonical paths that companion lookups present.
+        instance.managedRoot = fs.realpathSync.native(parent);
         const candidate = path.join(instance.managedRoot, randomUUID());
         fs.mkdirSync(candidate, { mode: 0o700 });
         directory = candidate;
       }
-      const canonical = fs.realpathSync(directory);
+      const canonical = fs.realpathSync.native(directory);
       lease = tryAcquireExclusiveSqliteCoordinator(path.join(canonical, LEASE_FILE));
       if (!lease) {
         throw new Error("Could not acquire new plugin source instance");

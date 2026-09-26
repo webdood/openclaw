@@ -665,7 +665,7 @@ export function createPluginSourceCapture(execute?: <T>(run: () => T) => T) {
       override !== undefined
         ? fs.mkdtempSync(path.join(override.directory, PLUGIN_SOURCE_CAPTURE_PREFIX))
         : instance!.createDirectory();
-    directory = fs.realpathSync(created);
+    directory = fs.realpathSync.native(created);
     fs.chmodSync(directory, 0o700);
   } catch (error) {
     if (created) {

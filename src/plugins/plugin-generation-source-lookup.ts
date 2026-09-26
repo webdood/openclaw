@@ -18,7 +18,20 @@ function getCapturedSource(
   source: string,
 ): string | undefined {
   const lexical = path.resolve(source);
-  return sources.get(lexical) ?? sources.get(canonicalSource(rootDir, sourceRoot, lexical));
+  const direct = sources.get(lexical) ?? sources.get(canonicalSource(rootDir, sourceRoot, lexical));
+  if (direct !== undefined || process.platform !== "win32") {
+    return direct;
+  }
+  // Windows paths are case-insensitive, but the captured keys and the lookup may
+  // carry different spellings of the same file (junction target text vs native
+  // realpath, 8.3 short names). Fall back to a case-folded match on a miss only.
+  const folded = lexical.toLowerCase();
+  for (const [captured, target] of sources) {
+    if (captured.toLowerCase() === folded) {
+      return target;
+    }
+  }
+  return undefined;
 }
 
 // A recovery resolver outlives its producer. Its closure contains copied path
