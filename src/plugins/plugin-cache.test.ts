@@ -153,10 +153,13 @@ function createRetargetedWindowsRootFixture(prefix: string, basename: string) {
   vi.spyOn(process, "platform", "get").mockReturnValue("win32");
 
   const observedRoot = path.join(observedParent, "plugin");
-  const originalLstat = fs.lstatSync;
-  let rootObservations = 0;
-  vi.spyOn(fs, "lstatSync").mockImplementation(((filePath, options) => {
-    if (filePath === observedRoot && ++rootObservations === 2) {
+  // Retarget the observed junction right after its identity was proven and
+  // before the physical root spelling is resolved for the descriptor boundary.
+  const originalNativeRealpath = fs.realpathSync.native;
+  let retargeted = false;
+  vi.spyOn(fs.realpathSync, "native").mockImplementation(((filePath, options) => {
+    if (filePath === observedRoot && !retargeted) {
+      retargeted = true;
       fs.unlinkSync(observedParent);
       fs.symlinkSync(
         replacementContainer,
@@ -164,8 +167,8 @@ function createRetargetedWindowsRootFixture(prefix: string, basename: string) {
         process.platform === "win32" ? "junction" : "dir",
       );
     }
-    return originalLstat(filePath, options as never);
-  }) as typeof fs.lstatSync);
+    return originalNativeRealpath(filePath, options as never);
+  }) as typeof fs.realpathSync.native);
   return {
     trustedAlias,
     observedPath: path.join(observedRoot, basename),
@@ -318,6 +321,41 @@ describe("plugin package facts", () => {
           rootDir: alias,
           rootRealPath: root,
           relativePath: "plugin.js",
+          rejectHardlinks: true,
+        }),
+      ).toMatchObject({ ok: true, exists: true });
+    });
+  });
+
+  it("admits a plugin package reached through a Windows junction above it", () => {
+    // ~/.openclaw -> C:\OpenClaw style layout: the junction is an ancestor of the
+    // package, so the package directory itself is a plain directory.
+    const { root, alias } = createWindowsRootAliasFixture(
+      "plugin-junction-ancestor-",
+      path.join("pkg", "dist", "index.js"),
+    );
+    const packageRoot = path.join(alias, "pkg");
+    const source = path.join(packageRoot, "dist", "index.js");
+    expect(fs.lstatSync(packageRoot).isSymbolicLink()).toBe(false);
+
+    const opened = openPluginRootFileSync({
+      rootPath: packageRoot,
+      rootRealPath: fs.realpathSync(packageRoot),
+      filePath: source,
+      rejectHardlinks: true,
+    });
+    expect(opened.ok).toBe(true);
+    if (opened.ok) {
+      expect(opened.rootRealPath).toBe(path.join(root, "pkg"));
+      fs.closeSync(opened.fd);
+    }
+
+    withPluginCache(createPluginCache(), () => {
+      expect(
+        checkPluginCacheEntry({
+          rootDir: packageRoot,
+          rootRealPath: pluginCacheRealpathSync(packageRoot) ?? undefined,
+          relativePath: "./dist/index.js",
           rejectHardlinks: true,
         }),
       ).toMatchObject({ ok: true, exists: true });

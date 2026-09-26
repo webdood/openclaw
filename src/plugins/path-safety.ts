@@ -32,12 +32,12 @@ function resolvePhysicalPathInsideRootSync(
     while (true) {
       const candidate = fs.statSync(current, { bigint: true });
       if (candidate.dev === root.dev && candidate.ino === root.ino) {
-        // Prefer the matching observed spelling unless it is itself a link.
-        // Windows 8.3 aliases are ordinary directory paths; junction roots retain
-        // their already-admitted canonical spelling.
-        const physicalRoot = fs.lstatSync(current).isSymbolicLink()
-          ? path.resolve(rootPath)
-          : current;
+        // Hand fs-safe the native canonical spelling of the matched root. The
+        // observed spelling may pass through a junction above the root (for
+        // example ~/.openclaw -> C:\OpenClaw), and an identity-bound ioFs skips
+        // fs-safe's own root canonicalization, so a junction spelling here makes
+        // final admission reject every descendant as outside the root.
+        const physicalRoot = fs.realpathSync.native(current);
         return {
           rootPath: physicalRoot,
           targetPath: path.resolve(physicalRoot, path.relative(current, targetPath)),
