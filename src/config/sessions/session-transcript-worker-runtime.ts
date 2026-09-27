@@ -170,7 +170,16 @@ export function retainSessionHistoryWorkerDatabase(
             assertCurrent();
             sequence = ++lane.nativeSequence;
             owned.nativeSequences.set(lane, sequence);
-            return { ...input, database };
+            // Readers may hand over the env from cloneEnvWithPlatformSemantics, which on
+            // win32 is a Proxy (case-insensitive lookup). Proxies fail structured clone
+            // ("#<Object> could not be cloned"), so post a plain copy across the worker
+            // boundary the same way readRowFacts already captures its env.
+            const env = "env" in input ? input.env : undefined;
+            return {
+              ...input,
+              ...(env && typeof env === "object" ? { env: { ...env } } : {}),
+              database,
+            };
           },
           {
             inputBytes,
