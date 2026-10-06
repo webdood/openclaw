@@ -74,7 +74,7 @@ const env = {
 const workerDeployVersion = (
   JSON.parse(fs.readFileSync("package.json", "utf8")) as { version: string }
 ).version;
-const OUTPUT_SOURCE_MAPS = process.env.OUTPUT_SOURCE_MAPS === "1";
+const OUTPUT_SOURCE_MAPS = process.env.OUTPUT_SOURCE_MAPS !== "0";
 const RUN_NODE_SKIP_DTS_BUILD = process.env.OPENCLAW_RUN_NODE_SKIP_DTS_BUILD === "1";
 const TSDOWN_DECLARATIONS = !RUN_NODE_SKIP_DTS_BUILD;
 export { createStateSchemaInlinePlugin, STATE_SCHEMA_INLINE_PLUGIN_NAME };
