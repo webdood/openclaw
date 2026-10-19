@@ -1,4 +1,3 @@
-/** Systemd service-definition authority and atomic, cross-process publication. */
 import { randomUUID } from "node:crypto";
 import { constants, promises as fs, type Stats } from "node:fs";
 import path from "node:path";
@@ -10,6 +9,7 @@ import { sha256Hex } from "../infra/crypto-digest.js";
 import { hasErrnoCode } from "../infra/errno.js";
 import { withFileLock } from "../infra/file-lock.js";
 import { canonicalPathFromExistingAncestor, findExistingAncestor } from "../infra/fs-safe.js";
+import { withServiceInspectionBudget } from "./service-inspection-budget.js";
 import {
   readServiceFileState,
   type GatewayServiceDefinitionTransactionHooks,
@@ -17,6 +17,7 @@ import {
 import {
   assertServiceDefinitionWritable,
   type GatewayServiceEnv,
+  type GatewayServiceReadOptions,
   type ServiceDefinitionMutationArtifact,
   type ServiceDefinitionMutationCapability,
   type SystemdServiceReadBinding,
@@ -38,7 +39,7 @@ import {
 import { assertNoSystemSystemdOwnership, isSystemSystemdOwnershipError } from "./systemd-system.js";
 import { splitSystemdLogicalLines } from "./systemd-unit.js";
 
-type Snapshot = { contents: Buffer; mode: number } | null;
+type Snapshot = { contents: Buffer; mode: number; requiresRegeneration?: boolean } | null;
 type SystemdDefinitionMutation = {
   snapshots: Map<string, Snapshot>;
   publish: (file: string, contents: string | Buffer, mode: number) => Promise<void>;
@@ -49,8 +50,12 @@ type SystemdDefinitionMutation = {
 const identity = (stat: Stats, contents?: Buffer) =>
   [stat.dev, stat.ino, stat.uid, stat.gid, stat.mode, contents && sha256Hex(contents)].join(":");
 
-function resolveMutationTargets(env: GatewayServiceEnv, environment: GatewayServiceEnv) {
-  const unit = resolveSystemdUnitPath(env);
+function resolveMutationTargets(
+  env: GatewayServiceEnv,
+  environment: GatewayServiceEnv,
+  target?: SystemdServiceReadTarget,
+) {
+  const unit = target?.unitPath ?? resolveSystemdUnitPath(env);
   const generated = resolveSystemdEnvironmentFilePath({
     stateDir: resolveStateDir({ ...env, ...environment }),
     environment,
@@ -100,11 +105,9 @@ async function readStableFile(
 async function inspect(
   env: GatewayServiceEnv,
   environment: GatewayServiceEnv,
-  timeoutMs?: number,
-  requireLoaded = false,
-  systemdReadBinding?: SystemdServiceReadBinding,
+  options?: GatewayServiceReadOptions,
 ) {
-  const { unit, generated } = resolveMutationTargets(env, environment);
+  const { unit, generated } = resolveMutationTargets(env, environment, options?.systemdReadTarget);
   const snapshots = new Map<string, Snapshot>();
   const fingerprint = new Map<string, string>();
   let shared = new Set<string>();
@@ -123,10 +126,8 @@ async function inspect(
   let artifact: ServiceDefinitionMutationArtifact | undefined;
   try {
     const command = await readSystemdServiceExecStart(env, {
+      ...options,
       requireEffective: true,
-      timeoutMs,
-      ...(systemdReadBinding ? { systemdReadBinding } : {}),
-      ...(requireLoaded ? { requireLoaded: true } : {}),
     });
     sourcePath = command?.sourcePath;
     const targets = new Set([unit, generated, `${unit}.bak`]);
@@ -179,7 +180,12 @@ async function inspect(
       if (directory && !actual.isDirectory()) {
         return result({ kind: "unknown", reason: "invalid-artifact", artifact });
       }
-      if (actual.mode & 0o022) {
+      // Older installers inherited umask for the unit and copied its mode to .bak.
+      // Safe parent authority lets the installer replace these owned regular files;
+      // loaded overrides and generated environment files are not legacy unit outputs.
+      const repairableGeneratedFile = actual.isFile() && (file === unit || file === `${unit}.bak`);
+      const requiresRegeneration = Boolean(actual.mode & 0o022);
+      if (requiresRegeneration && !repairableGeneratedFile) {
         return result({ kind: "unknown", reason: "unsafe-permissions", artifact });
       }
       if (directory) {
@@ -194,7 +200,11 @@ async function inspect(
       const { contents } = snapshot;
       fingerprint.set(file, identity(stat, contents));
       if (targets.has(file)) {
-        snapshots.set(file, { contents, mode: stat.mode & 0o777 });
+        snapshots.set(file, {
+          contents,
+          mode: stat.mode & 0o777,
+          ...(requiresRegeneration ? { requiresRegeneration: true } : {}),
+        });
       }
     }
     return result({ kind: "writable" });
@@ -216,74 +226,71 @@ export async function readSystemdDefinitionMutationCapability(
     systemdReadTarget?: SystemdServiceReadTarget;
   },
 ): Promise<ServiceDefinitionMutationCapability> {
-  if (options?.systemdReadTarget?.scope === "system") {
-    return { kind: "sealed", reason: "system-owned" };
-  }
-  const selected = path.basename(resolveSystemdUnitPath(env));
-  const names =
-    selected === "openclaw-gateway.service" ? [selected, "openclaw.service"] : [selected];
-  const budget =
-    options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
-      ? options.timeoutMs
-      : options?.requireLoaded
-        ? 5000
-        : undefined;
-  const deadlineAt = budget === undefined ? undefined : performance.now() + budget;
-  const remaining = () => {
-    if (deadlineAt === undefined) {
-      return undefined;
-    }
-    const value = deadlineAt - performance.now();
-    if (value <= 0) {
-      throw new Error("Definition inspection deadline expired.");
-    }
-    return value;
-  };
-  for (const name of names) {
-    try {
-      await assertNoSystemSystemdOwnership(
-        name,
-        remaining(),
-        ...(options?.requireLoaded ? [{ requireLoaded: true }] : []),
-      );
-    } catch (error) {
-      const owned =
-        isSystemSystemdOwnershipError(error) && error.ownership.status !== "unverifiable";
-      if (owned) {
+  return await withServiceInspectionBudget<Promise<ServiceDefinitionMutationCapability>>(
+    async (inspectionBudget) => {
+      if (options?.systemdReadTarget?.scope === "system") {
         return { kind: "sealed", reason: "system-owned" };
       }
-      const unverified = { kind: "unknown", reason: "system-ownership-unverified" } as const;
-      // A loaded user unit whose artifacts this account owns is the manager in
-      // charge; an unreachable system manager cannot make it a competing owner.
-      if (!options?.requireLoaded || !isSystemSystemdOwnershipError(error)) {
-        return unverified;
+      const selected =
+        options?.systemdReadTarget?.unitName ?? path.basename(resolveSystemdUnitPath(env));
+      const { environment = env, ...readOptions } = options ?? {};
+      const names =
+        selected === "openclaw-gateway.service" ? [selected, "openclaw.service"] : [selected];
+      const budget =
+        options?.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+          ? options.timeoutMs
+          : options?.requireLoaded
+            ? 5000
+            : undefined;
+      const deadlineAt = budget === undefined ? undefined : inspectionBudget.now() + budget;
+      const remaining = () => {
+        if (deadlineAt === undefined) {
+          return undefined;
+        }
+        const value = deadlineAt - inspectionBudget.now();
+        if (value <= 0) {
+          throw new Error("Definition inspection deadline expired.");
+        }
+        return value;
+      };
+      for (const name of names) {
+        try {
+          await assertNoSystemSystemdOwnership(
+            name,
+            remaining(),
+            ...(options?.requireLoaded ? [{ requireLoaded: true }] : []),
+          );
+        } catch (error) {
+          const owned =
+            isSystemSystemdOwnershipError(error) && error.ownership.status !== "unverifiable";
+          if (owned) {
+            return { kind: "sealed", reason: "system-owned" };
+          }
+          const unverified = { kind: "unknown", reason: "system-ownership-unverified" } as const;
+          // A loaded user unit whose artifacts this account owns is the manager in
+          // charge; an unreachable system manager cannot make it a competing owner.
+          if (!options?.requireLoaded || !isSystemSystemdOwnershipError(error)) {
+            return unverified;
+          }
+          const loaded = await inspect(env, environment, {
+            ...readOptions,
+            timeoutMs: remaining(),
+            requireLoaded: true,
+          }).then(
+            (inspection) => inspection.capability,
+            () => undefined,
+          );
+          return loaded?.kind === "writable" ? loaded : unverified;
+        }
       }
-      const loaded = await inspect(
-        env,
-        options.environment ?? env,
-        remaining(),
-        true,
-        options.systemdReadBinding,
-      ).then(
-        (inspection) => inspection.capability,
-        () => undefined,
-      );
-      return loaded?.kind === "writable" ? loaded : unverified;
-    }
-  }
-  try {
-    return (
-      await inspect(
-        env,
-        options?.environment ?? env,
-        remaining(),
-        options?.requireLoaded,
-        options?.systemdReadBinding,
-      )
-    ).capability;
-  } catch {
-    return { kind: "unknown", reason: "inspection-failed" };
-  }
+      try {
+        return (await inspect(env, environment, { ...readOptions, timeoutMs: remaining() }))
+          .capability;
+      } catch {
+        return { kind: "unknown", reason: "inspection-failed" };
+      }
+    },
+  );
 }
 
 export async function withSystemdDefinitionMutation<T>(
@@ -305,7 +312,7 @@ export async function withSystemdDefinitionMutation<T>(
     Promise.all([unit, generated].map(canonicalPathFromExistingAncestor));
   const preparation = await withGatewayServiceInstallationRecovery(
     async () => {
-      const initial = await inspect(env, environment, remainingTimeoutMs());
+      const initial = await inspect(env, environment, { timeoutMs: remainingTimeoutMs() });
       assertServiceDefinitionWritable(initial.capability);
       // Group-writable umasks must not create directories that inspect() would reject.
       assertGatewayServiceUpdateCurrent();
@@ -323,7 +330,7 @@ export async function withSystemdDefinitionMutation<T>(
     .toSorted();
   const execute = async (): Promise<T> => {
     const refresh = async (unchanged = false, firstUnitPublication = false) => {
-      const current = await inspect(env, environment, remainingTimeoutMs());
+      const current = await inspect(env, environment, { timeoutMs: remainingTimeoutMs() });
       assertServiceDefinitionWritable(current.capability);
       const expected = new Map(initial.fingerprint);
       // LoadUnit can reveal shared defaults only after the first base publication.
@@ -476,7 +483,7 @@ export async function withSystemdDefinitionMutation<T>(
       if (published === undefined) {
         return false;
       }
-      const current = await inspect(env, environment, remainingTimeoutMs());
+      const current = await inspect(env, environment, { timeoutMs: remainingTimeoutMs() });
       // A refreshed global snapshot never grants ownership of another artifact's edit.
       if (current.capability.kind !== "writable" || current.fingerprint.get(file) !== published) {
         return false;

@@ -33,10 +33,12 @@ import {
   verifyDashboardAssetUrls,
 } from "./network-smokes.ts";
 import {
+  captureGatewayProcess,
+  configureReplacementGatewayPort,
   hasChildExited,
   registerActiveChildProcessTree,
   runCommand,
-  waitForGatewayWithStartupMigrationRestart,
+  waitForGatewayWithStartupRecovery,
 } from "./process.ts";
 import { logLanePhase } from "./reporting.ts";
 import { formatError, sleep } from "./shared.ts";
@@ -156,41 +158,12 @@ export async function startGateway(params: LaneCommandParams): Promise<GatewayHa
     },
   );
   const activeChildTree = registerActiveChildProcessTree(child);
-  child.stdout?.on("data", (chunk) => {
-    gatewayLog.write(chunk);
-  });
-  child.stderr?.on("data", (chunk) => {
-    gatewayLog.write(chunk);
-  });
-  let resolveChildClose: () => void;
-  const childClosePromise = new Promise<void>((resolvePromise) => {
-    resolveChildClose = resolvePromise;
-  });
-  let closeLogPromise: Promise<void> | undefined;
-  const closeLog = () => {
-    closeLogPromise ??= new Promise<void>((resolvePromise) => {
-      gatewayLog.once("error", () => resolvePromise());
-      gatewayLog.end(() => resolvePromise());
-    });
-    return closeLogPromise;
-  };
-  child.once("close", () => {
-    resolveChildClose();
-    activeChildTree.unregister();
-    void closeLog();
-  });
-  child.once("error", () => {
-    resolveChildClose();
-    activeChildTree.unregister();
-    void closeLog();
-  });
-  return {
+  return captureGatewayProcess(
     child,
-    closeLog,
-    launchLogOffset,
-    logPath: params.logPath,
-    waitForClose: () => childClosePromise,
-  };
+    gatewayLog,
+    { launchLogOffset, logPath: params.logPath },
+    activeChildTree.unregister,
+  );
 }
 
 export async function waitForGateway(
@@ -205,14 +178,31 @@ export async function waitForGateway(
       throw new Error("Gateway restart coordination requires a gateway log path.");
     }
     const gatewayLogPath = params.gatewayLogPath;
-    await waitForGatewayWithStartupMigrationRestart({
+    await waitForGatewayWithStartupRecovery({
+      gatewayPort: params.lane.gatewayPort,
       gatewayHolder: params.gatewayHolder,
-      restartGateway: () =>
-        startGateway({
+      restartGateway: async (reason) => {
+        if (reason === "port-busy") {
+          await configureReplacementGatewayPort({
+            lane: params.lane,
+            logPath: params.logPath,
+            run: (args, timeoutMs) =>
+              runOpenClaw({
+                lane: params.lane,
+                env: params.env,
+                args,
+                logPath: params.logPath,
+                timeoutMs,
+                check: false,
+              }),
+          });
+        }
+        return startGateway({
           lane: params.lane,
           env: params.env,
           logPath: gatewayLogPath,
-        }),
+        });
+      },
       waitUntilReady: (gateway) =>
         waitForGateway({
           lane: params.lane,

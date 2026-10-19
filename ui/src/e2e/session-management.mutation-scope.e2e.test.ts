@@ -18,6 +18,7 @@ import {
   sessionsListResponse,
   waitForPatch,
 } from "./session-management.test-support.ts";
+import { chooseSidebarMenuOption, closeSidebarMenu } from "./sidebar-session-menu.test-support.ts";
 
 const suite = createSessionManagementE2eSuite();
 
@@ -116,11 +117,8 @@ suite.define(() => {
         await page.goto(controlUiSessionUrl(suite.server.baseUrl, original.key));
         await rowFor(original.key).waitFor({ state: "visible" });
         if (filter === "All") {
-          await sidebar.getByRole("button", { name: "Filter & sort" }).click();
-          await page
-            .locator(".sidebar-session-sort-menu")
-            .getByRole("menuitemradio", { name: filter, exact: true })
-            .click();
+          await chooseSidebarMenuOption(page, "Status", filter);
+          await closeSidebarMenu(page);
           await gateway.waitForRequest("sessions.list", {
             match: { agentId: "main", archived: "all" },
           });
@@ -128,17 +126,10 @@ suite.define(() => {
         const method = operation === "rename" ? "sessions.patch" : "sessions.patchMany";
         await gateway.deferNext(method);
         if (operation === "rename") {
-          if (filter === "All") {
-            await rowFor(original.key).click({ button: "right" });
-            await page.getByRole("menuitem", { name: "Rename…", exact: true }).click();
-          } else {
-            await page.locator(".chat-pane__session-title-button").click();
-          }
-          const input = page.locator(
-            filter === "All"
-              ? 'openclaw-modal-dialog[label="Rename session"] input'
-              : ".chat-pane__session-title-input",
-          );
+          // The inline editor permits navigation while the mutation is pending;
+          // the sidebar rename dialog intentionally holds focus until it settles.
+          await page.locator(".chat-pane__session-title-button").click();
+          const input = page.locator(".chat-pane__session-title-input");
           await input.fill("Renamed original");
           await input.press("Enter");
           const request = await waitForPatch(
@@ -172,7 +163,7 @@ suite.define(() => {
         await sidebar.getByRole("button", { name: /Switch agent/ }).click();
         await sidebar
           .locator("wa-dropdown.sidebar-agent-menu")
-          .getByRole("menuitemradio", { name: "Research", exact: true })
+          .getByRole("menuitem", { name: "Research", exact: true })
           .click();
         await rowFor(researchRows[1]!.key).waitFor({ state: "visible" });
         await sidebar
@@ -246,7 +237,7 @@ suite.define(() => {
         await sidebar.getByRole("button", { name: /Switch agent/ }).click();
         await sidebar
           .locator("wa-dropdown.sidebar-agent-menu")
-          .getByRole("menuitemradio", { name: "Main", exact: true })
+          .getByRole("menuitem", { name: "Main", exact: true })
           .click();
         if (operation === "rename") {
           await expect.poll(() => rowFor(original.key).textContent()).toContain("Renamed original");
@@ -269,7 +260,7 @@ suite.define(() => {
         await sidebar.getByRole("button", { name: /Switch agent/ }).click();
         await sidebar
           .locator("wa-dropdown.sidebar-agent-menu")
-          .getByRole("menuitemradio", { name: "Research", exact: true })
+          .getByRole("menuitem", { name: "Research", exact: true })
           .click();
         const returnedList = await gateway.waitForRequest("sessions.list", {
           match: researchMatch,

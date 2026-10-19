@@ -29,11 +29,13 @@ import {
 import { readLogFileSize } from "./logs.ts";
 import {
   canConnectToLoopbackPort,
+  captureGatewayProcess,
+  configureReplacementGatewayPort,
   hasChildExited,
   resolveCommandSpawnInvocation,
   runCommand,
   runCommandInvocation,
-  waitForGatewayWithStartupMigrationRestart,
+  waitForGatewayWithStartupRecovery,
   withAllocatedGatewayPort,
 } from "./process.ts";
 import { formatError, shellEscapeForSh, sleep } from "./shared.ts";
@@ -164,17 +166,8 @@ export async function runInstallerSmoke(params: {
   logPath: string;
 }) {
   const script = buildInstallerSmokeScript(params);
-  if (process.platform === "win32") {
-    await runPowerShellScript(script, {
-      cwd: params.lane.homeDir,
-      env: params.env,
-      logPath: params.logPath,
-      timeoutMs: installTimeoutMs(),
-    });
-    return;
-  }
-
-  await runPosixShellScript(script, {
+  const runScript = process.platform === "win32" ? runPowerShellScript : runPosixShellScript;
+  await runScript(script, {
     cwd: params.lane.homeDir,
     env: params.env,
     logPath: params.logPath,
@@ -182,20 +175,14 @@ export async function runInstallerSmoke(params: {
   });
 }
 
-export function buildWindowsPathBootstrapScript(
-  options: { includeCurrentProcessPath?: boolean } = {},
-) {
-  const includeCurrentProcessPath = options.includeCurrentProcessPath !== false;
+function buildWindowsPathBootstrapScript() {
   // setup-node provisions the supported runtime in the current process PATH. Keep it ahead of
   // stale runner image entries while still merging newly persisted user and machine paths.
-  const pathCandidates = includeCurrentProcessPath
-    ? "@($env:Path, $userPath, $machinePath)"
-    : "@($userPath, $machinePath)";
   return `
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $segments = New-Object System.Collections.Generic.List[string]
-foreach ($candidate in ${pathCandidates}) {
+foreach ($candidate in @($env:Path, $userPath, $machinePath)) {
   foreach ($segment in ($candidate -split ';')) {
     if ([string]::IsNullOrWhiteSpace($segment)) {
       continue
@@ -382,25 +369,11 @@ export async function resolveInstalledGatewayStopArgs(params: {
     cwd: params.cwd,
     env: params.env,
     logPath: params.logPath,
-    timeoutMs: 15_000,
-  });
-  return buildGatewayStopArgsFromHelpText(`${help.stdout}\n${help.stderr}`);
-}
-
-async function readInstalledUpdateStatus(params: {
-  cliPath: string;
-  cwd: string;
-  env: NodeJS.ProcessEnv;
-  logPath: string;
-}) {
-  return runInstalledCli({
-    cliPath: params.cliPath,
-    args: ["update", "status", "--json"],
-    cwd: params.cwd,
-    env: params.env,
-    logPath: params.logPath,
+    // Help takes about 2s on Windows runners but exceeded 15s on an overloaded one;
+    // share the installed-CLI budget so a capability probe cannot fail the lane.
     timeoutMs: 2 * 60 * 1000,
   });
+  return buildGatewayStopArgsFromHelpText(`${help.stdout}\n${help.stderr}`);
 }
 
 export async function ensureDevUpdateGitInstall(params: {
@@ -410,7 +383,9 @@ export async function ensureDevUpdateGitInstall(params: {
   logsDir: string;
   requestedRef: string;
 }) {
-  const updateStatus = await readInstalledUpdateStatus({
+  const updateStatus = await runInstalledCli({
+    args: ["update", "status", "--json"],
+    timeoutMs: 2 * 60 * 1000,
     cliPath: params.cliPath,
     cwd: params.lane.homeDir,
     env: params.env,
@@ -516,39 +491,7 @@ export async function startManualGatewayFromInstalledCli(params: {
     windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     windowsHide: true,
   });
-  child.stdout?.on("data", (chunk) => {
-    gatewayLog.write(chunk);
-  });
-  child.stderr?.on("data", (chunk) => {
-    gatewayLog.write(chunk);
-  });
-  let resolveChildClose: () => void;
-  const childClosePromise = new Promise<void>((resolvePromise) => {
-    resolveChildClose = resolvePromise;
-  });
-  let closeLogPromise: Promise<void> | undefined;
-  const closeLog = () => {
-    closeLogPromise ??= new Promise<void>((resolvePromise) => {
-      gatewayLog.once("error", () => resolvePromise());
-      gatewayLog.end(() => resolvePromise());
-    });
-    return closeLogPromise;
-  };
-  child.once("close", () => {
-    resolveChildClose();
-    void closeLog();
-  });
-  child.once("error", () => {
-    resolveChildClose();
-    void closeLog();
-  });
-  return {
-    child,
-    closeLog,
-    launchLogOffset,
-    logPath: params.logPath,
-    waitForClose: () => childClosePromise,
-  };
+  return captureGatewayProcess(child, gatewayLog, { launchLogOffset, logPath: params.logPath });
 }
 
 async function resolveInstalledGatewayStatusArgs(params: {
@@ -621,15 +564,33 @@ export async function waitForInstalledGateway(params: {
       throw new Error("Gateway restart coordination requires a gateway log path.");
     }
     const gatewayLogPath = params.gatewayLogPath;
-    await waitForGatewayWithStartupMigrationRestart({
+    await waitForGatewayWithStartupRecovery({
+      gatewayPort: params.lane.gatewayPort,
       gatewayHolder: params.gatewayHolder,
-      restartGateway: () =>
-        startManualGatewayFromInstalledCli({
+      restartGateway: async (reason) => {
+        if (reason === "port-busy") {
+          await configureReplacementGatewayPort({
+            lane: params.lane,
+            logPath: params.logPath,
+            run: (args, timeoutMs) =>
+              runInstalledCli({
+                cliPath: params.cliPath,
+                args,
+                cwd: params.lane.homeDir,
+                env: params.env,
+                logPath: params.logPath,
+                timeoutMs,
+                check: false,
+              }),
+          });
+        }
+        return startManualGatewayFromInstalledCli({
           lane: params.lane,
           cliPath: params.cliPath,
           env: params.env,
           logPath: gatewayLogPath,
-        }),
+        });
+      },
       waitUntilReady: (gateway) =>
         waitForInstalledGateway({
           lane: params.lane,

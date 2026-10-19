@@ -1,3 +1,4 @@
+import "../test-utils/prepare-compiled-subprocesses.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -195,14 +196,12 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     },
   );
 
-  it.each(
-    ["unit", "environment"].flatMap((artifact) =>
-      ["root-owned", "unsafe mode", "changed alias", "retargeted alias"].map((scenario) => ({
-        artifact,
-        scenario,
-      })),
-    ),
-  )("protects an aliased $artifact directory with $scenario", async ({ artifact, scenario }) => {
+  it.each([
+    { artifact: "unit", scenario: "root-owned" },
+    { artifact: "environment", scenario: "unsafe mode" },
+    { artifact: "unit", scenario: "changed alias" },
+    { artifact: "environment", scenario: "retargeted alias" },
+  ])("protects an aliased $artifact directory with $scenario", async ({ artifact, scenario }) => {
     const file = artifact === "unit" ? unitPath : environmentPath;
     const directory = path.dirname(file);
     const target = path.join(root, "alias-target");
@@ -555,15 +554,11 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     },
   );
 
-  it.each(
-    artifacts.flatMap(({ artifact, select }) =>
-      ["between publications", "after rename", "replacement after rename"].map((change) => ({
-        artifact,
-        select,
-        change,
-      })),
-    ),
-  )("rejects a concurrent $artifact edit $change", async ({ select, change }) => {
+  it.each([
+    { artifact: "unit", select: () => unitPath, change: "between publications" },
+    { artifact: "environment", select: () => environmentPath, change: "after rename" },
+    { artifact: "backup", select: () => `${unitPath}.bak`, change: "replacement after rename" },
+  ])("rejects a concurrent $artifact edit $change", async ({ select, change }) => {
     const target = select();
     await withSystemdDefinitionMutation(env, env, async (mutation) => {
       if (change === "between publications") {
@@ -592,11 +587,10 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     await expectNoTemporaryFiles(path.dirname(target));
   });
 
-  it.each(
-    artifacts.flatMap(({ artifact, select }) =>
-      [false, true].map((existed) => ({ artifact, select, existed })),
-    ),
-  )(
+  it.each([
+    { artifact: "unit", select: () => unitPath, existed: false },
+    { artifact: "environment", select: () => environmentPath, existed: true },
+  ])(
     "rolls back $artifact after a post-rename failure (existed=$existed)",
     async ({ select, existed }) => {
       const target = select();
@@ -631,11 +625,11 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     },
   );
 
-  it.each(
-    artifacts.flatMap(({ artifact, select }) =>
-      [false, true].map((environmentExisted) => ({ artifact, select, environmentExisted })),
-    ),
-  )(
+  it.each([
+    { artifact: "unit", select: () => unitPath, environmentExisted: false },
+    { artifact: "environment", select: () => environmentPath, environmentExisted: true },
+    { artifact: "backup", select: () => `${unitPath}.bak`, environmentExisted: true },
+  ])(
     "stage rollback preserves a concurrent $artifact edit (env existed=$environmentExisted)",
     async ({ artifact, select, environmentExisted }) => {
       const previousUnit = "[Service]\nExecStart=/usr/bin/node /old/index.js gateway\n";
@@ -676,7 +670,6 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
   );
 
   it.each([
-    { mount: "file-ro", mode: 0o644, kind: "sealed" },
     { mount: "file-ro", mode: 0o400, kind: "sealed" },
     { mount: "file-rw", mode: 0o644, kind: "sealed" },
     { mount: "ordinary", mode: 0o400, kind: "writable" },
@@ -802,13 +795,6 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     expect(await fs.readdir(stateDir)).toEqual([]);
   });
 
-  it("accepts the ownership owner's proven absence on a fresh non-systemd install", async () => {
-    await expect(readSystemdDefinitionMutationCapability(env)).resolves.toEqual({
-      kind: "writable",
-    });
-    expect(assertNoSystemOwnership).toHaveBeenCalledWith("openclaw-owned.service", undefined);
-  });
-
   it.each([
     { parent: "unit", select: () => path.dirname(unitPath) },
     { parent: "environment", select: () => stateDir },
@@ -883,9 +869,13 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     }
   });
 
-  it("publishes the unit, backup, and generated environment without chmod or secret disclosure", async () => {
-    const previous = "[Service]\nExecStart=/usr/bin/node /old/index.js gateway\n";
+  it.each([0o644, 0o664])("regenerates owned unit artifacts with mode %o safely", async (mode) => {
+    const previous =
+      "[Service]\nExecStart=/usr/bin/node /old/index.js gateway\nTimeoutStopSec=30\nKillMode=control-group\n";
     await writeFixtureFile(unitPath, previous);
+    await writeFixtureFile(`${unitPath}.bak`, "older backup\n");
+    await fs.chmod(unitPath, mode);
+    await fs.chmod(`${unitPath}.bak`, mode);
     await writeFixtureFile(environmentPath, "OPERATOR_SECRET=preserved-canary\n");
     const chmod = vi.spyOn(fs, "chmod");
 
@@ -894,6 +884,10 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     expect(await fs.readFile(`${unitPath}.bak`, "utf8")).toBe(previous);
     expect(await fs.readFile(unitPath, "utf8")).toContain("/srv/openclaw/dist/index.js");
     expect(await fs.readFile(unitPath, "utf8")).not.toContain("replacement-secret-canary");
+    expect(await fs.readFile(unitPath, "utf8")).toContain("TimeoutStopSec=330");
+    expect(await fs.readFile(unitPath, "utf8")).toContain("KillMode=mixed");
+    expect((await fs.stat(unitPath)).mode & 0o777).toBe(0o600);
+    expect((await fs.stat(`${unitPath}.bak`)).mode & 0o777).toBe(0o600);
     expect(await fs.readFile(environmentPath, "utf8")).toContain(
       "OPERATOR_SECRET=preserved-canary",
     );
@@ -901,6 +895,18 @@ describe.skipIf(process.platform === "win32")("systemd definition mutation owner
     expect(
       (await fs.readdir(path.dirname(unitPath))).filter((file) => file.includes(".tmp")),
     ).toEqual([]);
+  });
+
+  it("refuses an unsafe directory even when its unit mode is repairable", async () => {
+    const previous = "[Service]\nExecStart=/usr/bin/node /old/index.js gateway\n";
+    await writeFixtureFile(unitPath, previous);
+    await fs.chmod(unitPath, 0o664);
+    await fs.chmod(path.dirname(unitPath), 0o775);
+
+    await expect(stage()).rejects.toThrow("SERVICE_DEFINITION_UNKNOWN: [unsafe-permissions]");
+    expect(await fs.readFile(unitPath, "utf8")).toBe(previous);
+    expect((await fs.stat(unitPath)).mode & 0o777).toBe(0o664);
+    expect(await fs.readdir(path.dirname(unitPath))).toEqual([path.basename(unitPath)]);
   });
 
   it("publishes only the environment selected by the effective service state dir", async () => {

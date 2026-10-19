@@ -1,6 +1,3 @@
-/**
- * Resolves Claude CLI project storage directories for OpenClaw workspaces.
- */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -50,7 +47,6 @@ function resolveClaudeConfigDir(homeDir: string, env: NodeJS.ProcessEnv): string
   return configured ? path.resolve(configured) : path.join(homeDir, ".claude");
 }
 
-/** Resolves Claude CLI's per-workspace project directory. */
 export function resolveClaudeCliProjectDirForWorkspace(params: {
   workspaceDir: string;
   homeDir?: string;

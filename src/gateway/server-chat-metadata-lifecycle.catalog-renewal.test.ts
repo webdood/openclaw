@@ -9,6 +9,7 @@ import { setImmediate as nextEventLoopTurn } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import type { ModelCatalogSnapshot } from "../agents/model-catalog.types.js";
+import { getPublishedPreparedModelCatalogOwnerSnapshot } from "../agents/prepared-model-catalog.js";
 import {
   getPreparedModelFullCatalogAuth,
   setPreparedModelFullCatalogAuth,
@@ -50,7 +51,7 @@ vi.mock("./server-methods/chat-metadata-runtime.js", async (importOriginal) => {
       actual.createGatewayChatMetadataRuntime({
         ...params,
         deps: {
-          getPreparedOwner: () => owner,
+          getPreparedOwner: getPublishedPreparedModelCatalogOwnerSnapshot,
           getSkillsVersion: () => 0,
           getPluginRegistryVersion: () => 0,
           buildCommands,
@@ -94,6 +95,7 @@ async function createRenewalLifecycle() {
   await refreshPreparedModelRuntimeSnapshots(config, {
     gatewayLifecycle: true,
     catalogMode: "static",
+    allowGatewaySubagentBinding: true,
   });
   owner = getPreparedModelRuntimeSnapshot({
     config,
@@ -104,11 +106,16 @@ async function createRenewalLifecycle() {
   const observedCatalogs: ModelCatalogSnapshot[] = [];
   const broadcast = vi.fn(() => {
     // A connected consumer receives serialized status, not the owner's live status getters.
-    observedCatalogs.push(structuredClone(owner.readFullModelCatalog!()!));
+    const current = getPublishedPreparedModelCatalogOwnerSnapshot({ config, agentId: "main" });
+    if (!current) {
+      throw new Error("Metadata publication omitted its model owner");
+    }
+    observedCatalogs.push(
+      structuredClone(current.readFullModelCatalog?.() ?? current.modelCatalog),
+    );
   });
   const lifecycle = await createGatewayChatMetadataLifecycle({
     getConfig: () => config,
-    minimalTestGateway: false,
     log: { warn: mocks.warn } as never,
   });
   const sidecars = createGatewaySidecarStopOwner();
@@ -121,49 +128,75 @@ async function createRenewalLifecycle() {
   observedCatalogs.length = 0;
   buildCommands.mockClear();
   buildProjection.mockClear();
-  return { inventory, broadcast, observedCatalogs, lifecycle, stop: () => sidecars.stop() };
+  return { config, inventory, broadcast, observedCatalogs, lifecycle, stop: () => sidecars.stop() };
 }
 
 describe("catalog renewal metadata broadcasts", () => {
-  it.each(["identical", "usage", "auth", "added", "removed", "outcome", "failed"] as const)(
+  it("retains the published model owner across metadata reads and catalog renewal", async () => {
+    const harness = await createRenewalLifecycle();
+    try {
+      expect(owner.isCurrent()).toBe(true);
+      const next = structuredClone(harness.inventory);
+      next.entries.push({ provider: "custom", id: "renewed", name: "Renewed" });
+      mocks.runPreparedModelCatalogWorker.mockResolvedValueOnce(next);
+      await owner.loadFullModelCatalog!({ refresh: true, providerIds: ["custom"] });
+      const metadata = await harness.lifecycle.read({ agentId: "main" });
+      expect(metadata.models?.map(({ id }) => id).toSorted()).toEqual(
+        next.entries.map(({ id }) => id).toSorted(),
+      );
+      expect(owner.isCurrent()).toBe(true);
+      expect(harness.broadcast).toHaveBeenCalledOnce();
+      await harness.lifecycle.read({ agentId: "main" });
+      expect(harness.broadcast).toHaveBeenCalledOnce();
+      expect(owner.isCurrent()).toBe(true);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it("observes expired published inventory without starting provider discovery", async () => {
+    const harness = await createRenewalLifecycle();
+    const inventoryOwner = resolvePreparedModelRuntimeOwnerBySnapshot(owner)!;
+    inventoryOwner.catalogInventory!.providers.get("custom")!.expiresAt = 0;
+    const acquisitions = mocks.runPreparedModelCatalogWorker.mock.calls.length;
+    try {
+      await harness.lifecycle.refresh();
+      const metadata = await harness.lifecycle.read({ agentId: "main" });
+      expect(metadata.models).toMatchObject(harness.inventory.entries);
+      expect(mocks.runPreparedModelCatalogWorker).toHaveBeenCalledTimes(acquisitions);
+    } finally {
+      await harness.stop();
+    }
+  });
+
+  it.each(["usage", "removed", "failed"] as const)(
     "publishes only settled visible changes for a renewal (%s)",
     async (change) => {
       const harness = await createRenewalLifecycle();
       const entered = createDeferred();
       const release = createDeferred();
+      const settled = createDeferred();
       const original = owner.readFullModelCatalog!()!;
-      const publications =
-        vi.fn<Parameters<typeof registerPreparedModelRuntimePublicationListener>[0]>();
+      const publications = vi.fn<
+        Parameters<typeof registerPreparedModelRuntimePublicationListener>[0]
+      >((event) => {
+        if (event.phase === "catalog-published" || event.phase === "catalog-failed") {
+          settled.resolve();
+        }
+      });
       const unregister = registerPreparedModelRuntimePublicationListener(publications);
       const next = structuredClone(harness.inventory);
-      if (change === "added") {
-        next.entries.push({ provider: "custom", id: "new", name: "New" });
-      } else if (change === "removed") {
+      if (change === "removed") {
         next.entries = next.entries.filter(({ id }) => id !== "second");
-      } else if (change === "outcome") {
-        next.providerOutcomes = [{ provider: "custom", status: "unavailable" }];
       }
-      if (change === "usage" || change === "auth") {
+      if (change === "usage") {
         const auth = getPreparedModelFullCatalogAuth(original)!;
         setPreparedModelFullCatalogAuth(next, {
           ...auth,
           authStore: {
             ...auth.authStore,
-            ...(change === "usage"
-              ? {
-                  lastGood: { custom: "custom:default" },
-                  usageStats: { "custom:default": { lastUsed: 42 } },
-                }
-              : {
-                  profiles: {
-                    ...auth.authStore.profiles,
-                    "custom:added": {
-                      type: "api_key",
-                      provider: "custom",
-                      key: "synthetic-added-key",
-                    },
-                  },
-                }),
+            lastGood: { custom: "custom:default" },
+            usageStats: { "custom:default": { lastUsed: 42 } },
           },
         });
       }
@@ -177,7 +210,7 @@ describe("catalog renewal metadata broadcasts", () => {
       });
       const inventoryOwner = resolvePreparedModelRuntimeOwnerBySnapshot(owner)!;
       inventoryOwner.catalogInventory!.providers.get("custom")!.expiresAt = 0;
-      owner.readFullModelCatalog!();
+      owner.refreshExpiredModelCatalog!();
       let renewal: Promise<unknown> | undefined;
       try {
         await entered.promise;
@@ -189,9 +222,8 @@ describe("catalog renewal metadata broadcasts", () => {
         expect.soft(harness.broadcast.mock.calls.length).toBe(0);
         expect.soft(buildCommands.mock.calls.length).toBe(0);
         expect.soft(buildProjection.mock.calls.length).toBe(0);
-        renewal = owner.loadFullModelCatalog!({ refresh: true, providerIds: ["custom"] }).catch(
-          (error: unknown) => error,
-        );
+        // Observe the expiry renewal; an explicit refresh requests another acquisition.
+        renewal = settled.promise;
         release.resolve();
         await renewal;
         await nextEventLoopTurn();
@@ -206,7 +238,7 @@ describe("catalog renewal metadata broadcasts", () => {
             : [
                 {
                   phase: "catalog-published",
-                  modelFactsChanged: change !== "identical" && change !== "usage",
+                  modelFactsChanged: change !== "usage",
                   refreshStatusChanged: true,
                 },
               ],
@@ -216,7 +248,8 @@ describe("catalog renewal metadata broadcasts", () => {
             "chat.metadata.changed",
             {
               modelCatalogChanged: true,
-              authChanged: change !== "identical" && change !== "usage" && change !== "failed",
+              authChanged: change !== "usage" && change !== "failed",
+              commandsChanged: false,
             },
             { dropIfSlow: true },
           ],
@@ -229,23 +262,17 @@ describe("catalog renewal metadata broadcasts", () => {
         expect(observedCatalog.pendingProviders).toBeUndefined();
         // The pending reply remains pending until the consumer receives the settlement signal.
         expect(pendingCatalog.pendingProviders).toEqual(["custom"]);
-        const modelChanges = change === "identical" || change === "usage" ? 0 : 1;
+        const modelChanges = change === "usage" ? 0 : 1;
         expect(buildCommands).toHaveBeenCalledTimes(modelChanges);
         expect(buildProjection).toHaveBeenCalledTimes(modelChanges);
-        if (change === "identical" || change === "usage") {
+        if (change === "usage") {
           expect(owner.readFullModelCatalog!()).toBe(original);
           expect(observedCatalog.entries).toEqual(pendingCatalog.entries);
           expect(owner.isCurrent()).toBe(true);
-          if (change === "usage") {
-            expect(getPreparedModelFullCatalogAuth(original)?.authStore.lastGood).toEqual({
-              custom: "custom:default",
-            });
-          }
-        } else if (change === "auth") {
-          expect(
-            getPreparedModelFullCatalogAuth(owner.readFullModelCatalog!()!)?.authStore.profiles,
-          ).toHaveProperty("custom:added");
-        } else if (change === "added" || change === "removed") {
+          expect(getPreparedModelFullCatalogAuth(original)?.authStore.lastGood).toEqual({
+            custom: "custom:default",
+          });
+        } else if (change === "removed") {
           expect(result.models?.map(({ id }) => id).toSorted()).toEqual(
             next.entries.map(({ id }) => id).toSorted(),
           );

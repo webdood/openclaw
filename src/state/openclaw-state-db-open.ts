@@ -1,31 +1,37 @@
-import { statSync } from "node:fs";
+import { statSync, type BigIntStats } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { formatErrorMessage } from "../infra/errors.js";
+import {
+  StateDatabaseAdmissionPendingError,
+  StateDatabaseOfflineMaintenanceError,
+} from "../infra/gateway-state-owner-record.js";
+import { assertStateDatabaseAccessAllowed } from "../infra/gateway-state-owner.js";
 import { enableNodeSqliteKyselyStatementCache } from "../infra/kysely-sync.js";
 import {
   runWithSqliteBusyTimeout,
   setSqliteBusyTimeout,
   type SqliteLockFailureReporting,
 } from "../infra/sqlite-busy-timeout.js";
-import {
-  createSqliteLifecycleAggregateError,
-  runWithSqliteCoordinator,
-} from "../infra/sqlite-coordinator.js";
+import { quarantineOrphanedSqliteSidecars } from "../infra/sqlite-files.js";
 import {
   assertSqliteIntegrity,
   isTerminalSqliteIntegrityError,
 } from "../infra/sqlite-integrity.js";
+import { createSqliteLifecycleAggregateError } from "../infra/sqlite-lifecycle-errors.js";
 import { isSqliteSchemaVersionError } from "../infra/sqlite-user-version.js";
+import { prepareSqliteDatabaseDirectory } from "../infra/sqlite-wal-filesystem.js";
 import { createSqliteWalReclamationResult } from "../infra/sqlite-wal-reclamation.js";
 import {
   configureSqliteConnectionPragmas,
   configureSqlitePreSchemaPragmas,
   type SqliteWalMaintenance,
 } from "../infra/sqlite-wal.js";
+import { readDatabaseIdentityBirthtime } from "../infra/sqlite-worker-identity.js";
 import {
-  acquireStateDatabaseCoordinator,
-  resolveStateLifecycleRuntimeDirectory,
-} from "../infra/state-database-coordinator.js";
+  captureSqliteWorkerWalMaintenanceSuspension,
+  getSqliteWorkerExistingDatabaseIdentity,
+} from "../infra/sqlite-worker-state-context.js";
+import { withStateDatabaseSchemaMaintenance } from "../infra/state-database-maintenance.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { openClawStateDatabaseCache } from "./openclaw-state-db-cache.js";
 import {
@@ -40,8 +46,9 @@ import {
 import { ensureOpenClawStatePermissions } from "./openclaw-state-db-permissions.js";
 import {
   assertSupportedStateSchemaVersion,
-  readStateSchemaMigrationVersion,
+  readStateSchemaContentVersion,
 } from "./openclaw-state-db-schema-version.js";
+import { assertOpenClawStateWriteAllowed } from "./openclaw-state-ownership.js";
 
 const stateDbLog = createSubsystemLogger("state/db");
 
@@ -49,7 +56,7 @@ function assertStateDatabaseIntegrityBeforeMutation(
   database: DatabaseSync,
   pathname: string,
 ): void {
-  const contentVersion = readStateSchemaMigrationVersion(database);
+  const contentVersion = readStateSchemaContentVersion(database);
   const hasApplicationSchema = database // sqlite-allow-raw -- Cold-open schema presence probe before Kysely exposure.
     .prepare("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1")
     .get();
@@ -69,7 +76,7 @@ function assertStateDatabaseIntegrityBeforeMutation(
   }
 }
 
-export function openUnpublishedStateDatabase(params: {
+type UnpublishedStateDatabaseOptions = {
   pathname: string;
   env: NodeJS.ProcessEnv;
   busyTimeoutMs: number;
@@ -78,34 +85,81 @@ export function openUnpublishedStateDatabase(params: {
   recordOpenFailure: (pathname: string, error: Error) => void;
   existingSchema?: boolean;
   initializationAgentPaths?: readonly string[];
-}): OpenClawStateDatabase {
+};
+
+export function openUnpublishedStateDatabase(
+  params: UnpublishedStateDatabaseOptions,
+): OpenClawStateDatabase {
+  const open = (schemaOwned: boolean): OpenClawStateDatabase => {
+    const existingIdentity = getSqliteWorkerExistingDatabaseIdentity(params.pathname);
+    const original =
+      params.existingSchema || existingIdentity
+        ? statSync(params.pathname, { bigint: true })
+        : statSync(params.pathname, { bigint: true, throwIfNoEntry: false });
+    if (
+      existingIdentity &&
+      (!original || `file:${original.dev}:${original.ino}` !== existingIdentity)
+    ) {
+      throw new Error("SQLite database file identity changed before existing-only open");
+    }
+    if (!original && !schemaOwned) {
+      return withStateDatabaseSchemaMaintenance(
+        { databasePath: params.pathname, busyTimeoutMs: params.busyTimeoutMs },
+        () => open(true),
+      );
+    }
+    if (original && !original.isFile()) {
+      throw new Error(`Existing shared-state database must be a regular file: ${params.pathname}`);
+    }
+    const initialization = prepareStateDatabaseInitialization(
+      params.pathname,
+      params.env,
+      params.initializationAgentPaths,
+    );
+    if (!original) {
+      quarantineOrphanedSqliteSidecars(params.pathname);
+      ensureOpenClawStatePermissions(params.pathname, params.env, { createDirectory: true });
+      prepareSqliteDatabaseDirectory(params.pathname);
+    }
+    return openNativeStateDatabase(params, initialization, original);
+  };
+  return open(false);
+}
+
+function openNativeStateDatabase(
+  params: UnpublishedStateDatabaseOptions,
+  initialization: StateDatabaseInitialization,
+  original: BigIntStats | undefined,
+): OpenClawStateDatabase {
   const { busyTimeoutMs, lockFailureReporting } = params;
-  const initialization = prepareStateDatabaseInitialization(
-    params.pathname,
-    params.env,
-    params.initializationAgentPaths,
-  );
-  const runtimeDirectory = resolveStateLifecycleRuntimeDirectory();
-  const original = params.existingSchema ? statSync(params.pathname) : undefined;
-  if (original && !original.isFile()) {
-    throw new Error(`Existing shared-state database must be a regular file: ${params.pathname}`);
-  }
   const assertSameFile = () => {
     if (original) {
-      const current = statSync(params.pathname);
-      if (!current.isFile() || current.dev !== original.dev || current.ino !== original.ino) {
+      const current = statSync(params.pathname, { bigint: true });
+      if (
+        !current.isFile() ||
+        current.dev !== original.dev ||
+        current.ino !== original.ino ||
+        readDatabaseIdentityBirthtime(current) !== readDatabaseIdentityBirthtime(original)
+      ) {
         throw new Error(`Existing shared-state database generation changed: ${params.pathname}`);
       }
     }
   };
-  if (!params.existingSchema) {
-    ensureOpenClawStatePermissions(params.pathname, params.env);
-  }
-  const db = openTrackedStateDatabase(params.pathname, { existingOnly: params.existingSchema });
+  // Observing an existing generation never authorizes recreating it after a reset.
+  const db = openTrackedStateDatabase(params.pathname, {
+    existingOnly: original !== undefined,
+    expectedIdentity: original ? `file:${original.dev}:${original.ino}` : undefined,
+  });
   let walMaintenance: SqliteWalMaintenance | undefined;
   try {
+    assertSameFile();
     enableNodeSqliteKyselyStatementCache(db);
     setSqliteBusyTimeout(db, busyTimeoutMs);
+    assertOpenClawStateWriteAllowed({
+      database: db,
+      databasePath: params.pathname,
+      env: params.env,
+    });
     if (params.existingSchema) {
       assertSameFile();
       params.ensureSchema(db, initialization);
@@ -115,11 +169,13 @@ export function openUnpublishedStateDatabase(params: {
         path: params.pathname,
         walMaintenance: {
           checkpoint: () => false,
+          stop: async () => {},
           close: () => true,
           reclaimFreePages: createSqliteWalReclamationResult,
         },
       };
     }
+    ensureOpenClawStatePermissions(params.pathname, params.env);
     const maintenance = runWithSqliteBusyTimeout(
       db,
       busyTimeoutMs,
@@ -137,16 +193,25 @@ export function openUnpublishedStateDatabase(params: {
               path: params.pathname,
               checkpoint: walMaintenance?.health,
             }),
-          runMaintenance: (operation) =>
-            runWithSqliteCoordinator(
-              acquireStateDatabaseCoordinator({
-                databasePath: params.pathname,
-                runtimeDirectory,
-                busyTimeoutMs: 350,
-              }),
-              "shared-state WAL maintenance",
-              operation,
-            ),
+          runMaintenance: (operation) => {
+            try {
+              assertStateDatabaseAccessAllowed(params.pathname);
+            } catch (error) {
+              if (
+                !(error instanceof StateDatabaseAdmissionPendingError) &&
+                !(error instanceof StateDatabaseOfflineMaintenanceError)
+              ) {
+                throw error;
+              }
+              // Another process's offline maintenance refuses this pass; the next tick retries.
+              stateDbLog.debug("Shared-state WAL maintenance deferred during offline maintenance", {
+                path: params.pathname,
+              });
+              return false;
+            }
+            return operation();
+          },
+          isScheduledMaintenanceSuspended: captureSqliteWorkerWalMaintenanceSuspension(),
           foreignKeys: true,
           synchronous: "NORMAL",
         });
@@ -156,6 +221,7 @@ export function openUnpublishedStateDatabase(params: {
       { lockFailureReporting },
     );
     ensureOpenClawStatePermissions(params.pathname, params.env);
+    assertSameFile();
     return { db, path: params.pathname, walMaintenance: maintenance };
   } catch (error) {
     // Acquisition owns the native handle until every setup and hardening step returns.

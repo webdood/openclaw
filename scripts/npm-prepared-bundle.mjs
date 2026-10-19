@@ -22,6 +22,10 @@ import {
   inspectActionsArtifactZipWithPolicy,
   readBoundedRegularFile,
 } from "./lib/actions-artifact-archive.mjs";
+import {
+  collectPublishableCorePackages,
+  CORE_PACKAGE_POLICY,
+} from "./lib/npm-core-release-packages.mjs";
 import { assertNpmShrinkwrapDependencies } from "./lib/npm-shrinkwrap-dependencies.mjs";
 import { isRecord } from "./lib/record-shared.mjs";
 import { resolveReleaseTagPackageIdentity } from "./lib/release-version.mjs";
@@ -47,9 +51,6 @@ const CALLER_WORKFLOWS = new Set([
   ".github/workflows/full-release-candidate.yml",
   ".github/workflows/full-release-artifacts.yml",
 ]);
-const CORE_PACKAGE_POLICY = JSON.parse(
-  readFileSync(new URL("./lib/npm-core-release-packages.json", import.meta.url), "utf8"),
-);
 const CORE_PACKAGES = CORE_PACKAGE_POLICY.map((entry) => entry.name);
 const MAX_TARBALL_BYTES = 192 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -93,7 +94,7 @@ function readJson(path, maxBytes = MAX_MANIFEST_BYTES) {
 }
 
 function writeJson(path, value) {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+  writeFileSync(path, `${JSON.stringify(value)}\n`);
 }
 
 function same(left, right, label) {
@@ -232,6 +233,31 @@ function githubJson(repository, suffix, runGh, query) {
   );
 }
 
+function jobExecution(job) {
+  return JSON.stringify([
+    job.status,
+    job.conclusion,
+    job.started_at,
+    job.completed_at,
+    (job.steps ?? []).map((step) => [
+      step.number,
+      step.name,
+      step.status,
+      step.conclusion,
+      step.started_at,
+      step.completed_at,
+    ]),
+  ]);
+}
+
+// Failed-job reruns list each retained green job again under the new attempt
+// with a fresh job ID; the copy keeps the original execution timestamps.
+export function sameJobExecution(left, right) {
+  return (
+    Boolean(left.started_at && left.completed_at) && jobExecution(left) === jobExecution(right)
+  );
+}
+
 function readAttemptJobs(repository, producer, runGh) {
   const jobs = [];
   for (let page = 1; page <= 10; page += 1) {
@@ -239,7 +265,8 @@ function readAttemptJobs(repository, producer, runGh) {
       repository,
       `actions/runs/${producer.runId}/attempts/${producer.runAttempt}/jobs?per_page=100&page=${page}`,
       runGh,
-      "{total_count,jobs:[.jobs[] | {id,name,run_id,run_attempt,head_sha,status,conclusion}]}",
+      // Keep the execution fields sameJobExecution compares.
+      "{total_count,jobs:[.jobs[] | {id,name,run_id,run_attempt,head_sha,status,conclusion,started_at,completed_at,steps:[(.steps // [])[] | {number,name,status,conclusion,started_at,completed_at}]}]}",
     );
     if (
       !Array.isArray(response.jobs) ||
@@ -362,7 +389,7 @@ export function verifyNpmBundleProducer({
     ) {
       throw new Error("Incomplete or mismatched npm producer attempt evidence.");
     }
-    if (jobs.some((entry) => entry.name === producer.jobName)) {
+    if (jobs.some((entry) => entry.name === producer.jobName && !sameJobExecution(job, entry))) {
       throw new Error("npm bundle producer job was superseded by a later attempt.");
     }
   }
@@ -859,24 +886,9 @@ export function prepareNpmPackageBundle({
       ),
     };
   };
-  const corePackageTarballs = CORE_PACKAGE_POLICY.flatMap((policy) => {
-    const packageName = policy.name;
-    const directory = join(sourceDir, policy.path);
-    if (policy.dependency) {
-      if (typeof root.dependencies?.[policy.dependency] !== "string") {
-        return [];
-      }
-    } else if (
-      !existsSync(join(directory, "package.json")) ||
-      readJson(join(directory, "package.json")).openclaw?.release?.publishToNpm !== true
-    ) {
-      return [];
-    }
-    if (readJson(join(directory, "package.json")).version !== root.version) {
-      throw new Error(`Core package version mismatch: ${packageName}.`);
-    }
-    return [pack(directory, packageName)];
-  });
+  const corePackageTarballs = collectPublishableCorePackages(sourceDir, root).map((policy) =>
+    pack(join(sourceDir, policy.path), policy.name),
+  );
   const aiPackage = corePackageTarballs.find(({ packageName }) => packageName === "@openclaw/ai");
   const hasRootShrinkwrap = existsSync(join(sourceDir, "npm-shrinkwrap.json"));
   if (aiPackage && hasRootShrinkwrap) {

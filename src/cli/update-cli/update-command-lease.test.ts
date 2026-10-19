@@ -31,6 +31,7 @@ import {
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
 import { VERSION } from "../../version.js";
+import * as restartHealth from "../daemon-cli/restart-health.js";
 import { registerUpdateCli } from "../update-cli.js";
 
 const mocks = vi.hoisted(() => ({
@@ -113,6 +114,21 @@ beforeEach(async () => {
     params.assertCurrent();
     return await publish(async () => params.assertCurrent());
   });
+  // Ordinary lease cases have no Gateway; restoration cases supply their managed service state.
+  const readHealth = async ({
+    port,
+  }: {
+    port: number;
+  }): Promise<Awaited<ReturnType<typeof restartHealth.waitForGatewayHealthyRestart>>> => ({
+    outcome: "failed",
+    runtime: { status: "stopped" },
+    portUsage: { port, status: "free", listeners: [], hints: [] },
+    healthy: false,
+    staleGatewayPids: [],
+    waitOutcome: "stopped-free",
+  });
+  vi.spyOn(restartHealth, "waitForGatewayHealthyRestart").mockImplementation(readHealth);
+  vi.spyOn(restartHealth, "inspectGatewayRestart").mockImplementation(readHealth);
   state = await createOpenClawTestState({
     label: "update-lease",
     env: {
@@ -216,7 +232,6 @@ async function invoke(
       {
         json: true,
         yes: true,
-        restart: false,
         timeout: "15",
         deferCompletionCache: true,
       },
@@ -405,7 +420,8 @@ describe("update orchestration lifecycle ownership", () => {
       shape: "malformed-prepare",
       version: VERSION,
       source: "export const prepareBundledPluginRuntime = 1;",
-      failure: /cannot complete its runtime artifacts/,
+      failure:
+        /^Installed runtime staging is unavailable: .+[/\\]scripts[/\\]stage-bundled-plugin-runtime\.mts$/u,
     },
     {
       shape: "missing-dependency",
@@ -790,7 +806,6 @@ describe("update orchestration lifecycle ownership", () => {
       channel: "beta",
       json: true,
       yes: true,
-      restart: false,
       deferCompletionCache: true,
     });
     expectSuccess("repair");
@@ -940,19 +955,25 @@ describe("update orchestration lifecycle ownership", () => {
     ],
     ["repair" as const, "finding" as const, "post-plugin-update-readiness-failed"],
     ["repair" as const, "execution" as const, "post-plugin-update-readiness-execution-failed"],
-  ])("%s leaves the Gateway stopped after a readiness %s", async (lane, failure, reason) => {
+  ])("%s preserves a readiness %s outcome", async (lane, failure, reason) => {
     await writeScenario(lane, {
       readinessFailure: failure,
       hostVersion: lane === "current-process" ? "1.0.0" : undefined,
     });
 
-    await invokeReportedFailure(lane);
+    if (failure === "finding") {
+      await invokeReportedFailure(lane);
+    } else {
+      await invoke(lane);
+    }
 
     expect(reportedResult(lane)).toMatchObject({
-      status: "error",
-      postUpdate: { plugins: { reason } },
+      status: failure === "finding" ? "error" : lane === "repair" ? "warning" : "ok",
+      postUpdate: { plugins: { status: failure === "finding" ? "error" : "warning", reason } },
     });
-    expect(mocks.restart).not.toHaveBeenCalled();
+    expect(mocks.restart).toHaveBeenCalledTimes(
+      failure === "execution" && lane !== "repair" ? 1 : 0,
+    );
     expect(await events()).toEqual([
       ...(lane === "repair" ? ["pre-attempt", "pre-acquired"] : []),
       ...(lane === "fresh-process" ? ["packages-acquired", "packages-released"] : []),

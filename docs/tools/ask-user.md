@@ -78,6 +78,10 @@ the time remaining, dismisses expired prompts, and restores pending questions
 for the selected session after reconnecting or switching sessions. Local mode
 keeps questions in the running process; they do not survive exiting the TUI.
 
+A turn started through the `agent` Gateway method with a messaging-channel
+target also delivers its question to that conversation. The question is an
+explicit tool message; automatic final-reply delivery is configured separately.
+
 ## Async questions
 
 Codex async questions use the same panel above the Control UI composer. They open
@@ -180,3 +184,9 @@ The model-facing contract tells the agent to:
 
 The agent should not use `ask_user` to ask whether it may proceed or to confirm
 its own plan.
+
+## Related
+
+- [Secrets](/tools/secrets) — the credential-safe path when the answer is a secret
+- [Control UI](/web/control-ui) — where the docked answer panel appears
+- [Tools overview](/tools) — the rest of the built-in tool surface
