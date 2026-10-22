@@ -8,6 +8,7 @@ import { createJiti } from "./jiti-factory.js";
 import {
   createPluginGenerationFileCapture,
   createPluginSourceLinkCapture,
+  ensurePluginDependencyLink,
 } from "./plugin-generation-file-capture.js";
 import { createPluginGenerationReceipt } from "./plugin-generation-receipt.js";
 import {
@@ -228,9 +229,9 @@ function createPluginGenerationArtifact(
           : destination;
       const link = path.join(lookupDirectory, "node_modules", name);
       packages.get(dependency.root)!.links.add(link);
-      if (!fs.existsSync(link)) {
-        fs.mkdirSync(path.dirname(link), { recursive: true, mode: 0o700 });
-        fs.symlinkSync(path.relative(path.dirname(link), captured), link, "junction");
+      // The captured target may still be unmaterialized here, which makes the link dangling;
+      // existsSync() would then miss it and symlinkSync() would throw EEXIST on the next call.
+      if (ensurePluginDependencyLink(link, captured)) {
         additions.add(link);
       }
     };

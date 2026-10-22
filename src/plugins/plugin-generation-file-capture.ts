@@ -36,6 +36,38 @@ export function createPluginSourceLinkCapture() {
   };
 }
 
+function samePath(left: string, right: string): boolean {
+  const normalize = (value: string) =>
+    process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+  return normalize(left) === normalize(right);
+}
+
+/**
+ * Point `link` at the captured dependency `target` as a directory junction.
+ *
+ * `fs.existsSync(link)` follows the junction, so a link whose target has not been materialized
+ * yet (metadata-only captures defer that copy) reads as absent and the next `symlinkSync` throws
+ * EEXIST. Inspect the link itself instead: keep a link that already points at `target`, replace
+ * one that points elsewhere, and leave a real directory alone. Returns true when a link was written.
+ */
+export function ensurePluginDependencyLink(link: string, target: string): boolean {
+  const entry = fs.lstatSync(link, { throwIfNoEntry: false });
+  if (entry && !entry.isSymbolicLink()) {
+    return false;
+  }
+  if (entry && samePath(path.resolve(path.dirname(link), fs.readlinkSync(link)), target)) {
+    return false;
+  }
+  fs.mkdirSync(path.dirname(link), { recursive: true, mode: 0o700 });
+  if (entry) {
+    // MoveFileEx cannot replace a directory junction on Windows; unlink only the reparse point.
+    fs.unlinkSync(link);
+    process.emitWarning(`Replacing plugin dependency link ${link}`);
+  }
+  fs.symlinkSync(path.relative(path.dirname(link), target), link, "junction");
+  return true;
+}
+
 /** Capture each selected package file once, retaining its source facts and ordered receipt. */
 export function createPluginGenerationFileCapture({
   boundary,
