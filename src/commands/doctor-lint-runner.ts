@@ -211,6 +211,11 @@ async function prepareDoctorLintExecution(
   if (opts.onlyIds?.length) {
     return await run();
   }
+  // The shared snapshot copies the state database and waits for it to stop changing,
+  // which can take minutes while a Gateway keeps writing. Say so before going quiet.
+  process.stderr.write(
+    "doctor: snapshotting the shared state database before running checks (waits for the file to stop changing; this can take minutes while the Gateway is running)...\n",
+  );
   let execution: DoctorLintExecution | undefined;
   try {
     return await withOpenClawStateDatabaseReadSnapshot(async () => (execution = await run()), {
