@@ -54,6 +54,36 @@ const DEFAULT_SQLITE_WAL_CHECKPOINT_INTERVAL_MS = 30 * 60 * 1000;
 // commit. It matches the inline autocheckpoint threshold so only pathological
 // high-water marks pay the truncation cost.
 const DEFAULT_SQLITE_WAL_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
+
+// ─── Webdood-defaults ─────────────────────────────────────────────────────────
+// Upstream ships with busyTimeoutMs defaulting to 0 everywhere it is left unset
+// in configureSqliteWalMaintenance.  On a single-host deployment (G1) the
+// in-process session-history worker pins a read snapshot indefinitely; with
+// busy_timeout=0 the periodic TRUNCATE checkpoint fails instantly and the WAL
+// grows ~12–16 MB/h, requiring a full gateway restart every 3–4 h to reclaim
+// space.
+//
+// A non-zero default gives the checkpoint a real retry window so that _transient_
+// readers (those that hold for milliseconds, not hours) no longer block compaction.
+// It does NOT fix a permanently-stuck reader, but it avoids spurious failures
+// during normal operation and means the connection-level busy_timeout is always
+// initialized rather than left at the SQLite default of 0.
+//
+// All WAL busy-timeout defaults in this file reference this single object.
+// Adjust here and every call site picks it up automatically.
+const WEBDOOD_WAL_DEFAULTS = {
+  wal: {
+    // How long (ms) the WAL maintenance connection waits for a blocking reader
+    // before aborting a checkpoint or WAL-enable operation.
+    // Upstream ships this as 0 (immediate failure on any contention).
+    // The article https://hynek.me/til/sqlite-read-only-wal-locked/ demonstrates
+    // that even a 1 s timeout eliminates lock failures during the brief exclusive
+    // -shm coordination that WAL requires at open/close time.  We default to 3 s.
+    busyTimeoutMs: 3_000,
+  },
+} as const;
+// ──────────────────────────────────────────────────────────────────────────────
+
 const JOURNAL_MODE_RETRY_INTERVAL_MS = 10;
 const JOURNAL_MODE_RETRY_SLEEP = new Int32Array(new SharedArrayBuffer(4));
 
@@ -236,10 +266,15 @@ export function configureSqliteWalMaintenance(
   db: DatabaseSync,
   options: SqliteWalMaintenanceOptions = {},
 ): SqliteWalMaintenance {
-  const busyTimeoutMs = options.busyTimeoutMs ?? 0;
-  if (options.busyTimeoutMs !== undefined) {
-    setSqliteBusyTimeout(db, options.busyTimeoutMs);
-  }
+  // Webdood-defaults: fall back to WEBDOOD_WAL_DEFAULTS.wal.busyTimeoutMs (3 s)
+  // instead of upstream's 0.  The setSqliteBusyTimeout call is now unconditional
+  // so the connection-level PRAGMA busy_timeout is always initialized.  Upstream
+  // only called it when the option was explicitly provided; callers that omit it
+  // were left at the SQLite C default of 0.  Callers that already pass an explicit
+  // value (e.g. OPENCLAW_SQLITE_BUSY_TIMEOUT_MS = 5000) are unaffected: their
+  // value takes precedence via the ?? operator.
+  const busyTimeoutMs = options.busyTimeoutMs ?? WEBDOOD_WAL_DEFAULTS.wal.busyTimeoutMs;
+  setSqliteBusyTimeout(db, busyTimeoutMs);
   const autoCheckpointPages = normalizeSqliteNonNegativeInteger(
     options.autoCheckpointPages ?? DEFAULT_SQLITE_WAL_AUTOCHECKPOINT_PAGES,
     "autoCheckpointPages",
@@ -375,7 +410,14 @@ export function configureSqliteWalMaintenance(
         (checkpointOwner.health?.walBytes ?? 0) > DEFAULT_SQLITE_WAL_JOURNAL_SIZE_LIMIT_BYTES
       ) {
         // A completed PASSIVE checkpoint need not recycle its high-water file
-        // until another commit. Try once without waiting for readers or writers.
+        // until another commit.  Try once without waiting for readers or writers.
+        //
+        // Webdood-note: keeping upstream's 0 here deliberately.  maintainPeriodic
+        // runs synchronously on the main event-loop thread; a non-zero timeout
+        // would stall the gateway for the full duration on every 10 s tick when
+        // any reader holds the WAL.  The WAL default for open/close contention is
+        // handled above via WEBDOOD_WAL_DEFAULTS.wal.busyTimeoutMs; that is where
+        // the article https://hynek.me/til/sqlite-read-only-wal-locked/ applies.
         admit?.("transaction");
         runWithSqliteBusyTimeout(db, 0, () => runTickCheckpoint("TRUNCATE"));
       }
