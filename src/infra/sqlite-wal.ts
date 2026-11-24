@@ -59,6 +59,9 @@ export type { SqliteWalReclamationResult } from "./sqlite-wal-reclamation.js";
 // when they register their owner and skip checkpoint-only ticks; worker
 // connections tick inline, so this threshold only bounds an unmaintained writer.
 const DEFAULT_SQLITE_WAL_AUTOCHECKPOINT_PAGES = 16_384;
+// SN: default busy timeout for maintenance connections. Upstream ships 0, which fails instantly on any lock.
+const DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 500;
+
 const DEFAULT_SQLITE_WAL_CHECKPOINT_TICK_MS = 10 * 1000;
 const DEFAULT_SQLITE_WAL_CHECKPOINT_INTERVAL_MS = 30 * 60 * 1000;
 // SQLite applies this ceiling when a fully checkpointed WAL resets on the next
@@ -280,10 +283,8 @@ export function configureSqliteWalMaintenance(
   db: DatabaseSync,
   options: SqliteWalMaintenanceOptions = {},
 ): SqliteWalMaintenance {
-  const busyTimeoutMs = options.busyTimeoutMs ?? 0;
-  if (options.busyTimeoutMs !== undefined) {
-    setSqliteBusyTimeout(db, options.busyTimeoutMs);
-  }
+  const busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_SQLITE_BUSY_TIMEOUT_MS;
+  setSqliteBusyTimeout(db, busyTimeoutMs);
   const autoCheckpointPages = normalizeSqliteNonNegativeInteger(
     options.autoCheckpointPages ?? DEFAULT_SQLITE_WAL_AUTOCHECKPOINT_PAGES,
     "autoCheckpointPages",
