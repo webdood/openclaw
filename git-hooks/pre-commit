@@ -6,4 +6,9 @@ ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   exit 1
 }
 cd "$ROOT_DIR"
+# webdood: every commit on this branch must also update the branch manifest.
+if git diff --cached --quiet -- ThisBranchContainsTheFollowing.md; then
+  echo '[pre-commit] ThisBranchContainsTheFollowing.md is not staged. Say what this commit adds and why.' >&2
+  exit 1
+fi
 exec node scripts/pre-commit/guard-staged-content.mjs
