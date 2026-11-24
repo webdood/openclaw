@@ -48,10 +48,11 @@ below: not ported, port only if the new build shows the failure or someone wants
 
 ### TUI feature (fork-only; no upstream equivalent)
 
-- LATER 4257d441e337 + 62f70ef8604f feat(tui): terminal window title follows the session name (/name foo).
-  Tried 2026-11-24: module and its 17 tests port as-is, but the one-line hook has no legal home. tui.ts (1532 counted
-  lines) and tui-event-handlers.ts (exactly 700) are both frozen by the line-cap ratchet, which rejects any growth.
-  Landing it means extracting the 120-line sessions.changed handler into a sibling module first. Deferred, Shannon to decide.
+- PORTED 4257d441e337 + 62f70ef8604f feat(tui): terminal window title follows the session name (/name foo).
+  Ported 2026-11-24 (second attempt): the 121-line sessions.changed handler moved out of tui-event-handlers.ts into
+  tui-sessions-changed.ts (createSessionsChangedHandler with explicit deps), which put that file back under its 700-line
+  cap; the window-title sync is the first line of the extracted handler. label added to SessionChangedEvent;
+  tui-window-title.ts/.test.ts taken as-is. 141 TUI tests pass.
 
 ### Browser extension (MV3 reconnects)
 
@@ -71,11 +72,14 @@ below: not ported, port only if the new build shows the failure or someone wants
 
 - 01ee3f9c7077 junction ancestors (plugins) - d6c17860bebc native-realpath capture keys (plugins)
 - aa139c729329 dangling dependency junctions - 9d28bd349322 + 12026b0234d5 browser MV3 reconnects
-- 4257d441e337 + 62f70ef8604f TUI window title (blocked by the line-cap ratchet on two frozen files, see above)
   All four are tagged LATER above with their reasons. The three plugin ones may already be covered by upstream's own
   Windows junction work (45f50f25, feccbe07, #185917); test on the new build before porting.
 
 ## New on this branch
+
+- (with the window-title port) refactor(tui): sessions.changed handler extracted to src/tui/tui-sessions-changed.ts.
+  Why: tui-event-handlers.ts sat exactly at the 700-line cap and the ratchet refuses growth; this is the "coherent
+  sibling module" the ratchet asks for. Behaviour unchanged; deps passed explicitly instead of closed over.
 
 - 1d9b15ab5aac fix(sqlite-wal): non-zero default busy timeout for WAL maintenance connections.
   What: configureSqliteWalMaintenance now defaults busyTimeoutMs to 500 ms (DEFAULT_SQLITE_BUSY_TIMEOUT_MS) when a
