@@ -37,7 +37,7 @@ Legend: PENDING = not yet ported. PORTED <sha> = on this branch. DROPPED = decid
 
 - PENDING 493f8031d151 doctor: say that database snapshots are in progress before going quiet.
   Why: doctor printed nothing for ~7 min during snapshots and kept getting killed as "hung".
-- PENDING 90ad4c409369 build: source maps on by default (opt-out with OUTPUT_SOURCE_MAPS=0). Applies cleanly.
+- PORTED 90ad4c409369 build: source maps on by default (opt-out with OUTPUT_SOURCE_MAPS=0). Cherry-picked 2026-11-24, clean.
 
 ### TUI feature (fork-only; no upstream equivalent)
 
