@@ -10,18 +10,19 @@ Branch `webdood` of github.com/webdood/openclaw. Rule: every commit on this bran
 
 ## Carried over from webdood-old (status per item; update as each lands)
 
-Legend: PENDING = not yet ported. PORTED <sha> = on this branch. DROPPED = decided unnecessary, reason given.
+Legend: PORTED = on this branch. DROPPED = decided unnecessary, reason given. LATER = in the Nice-to-Have-maybe-Later list
+below: not ported, port only if the new build shows the failure or someone wants the feature.
 
 ### Windows state-dir junction fixes (~/.openclaw -> C:\OpenClaw; OPENCLAW_STATE_DIR=C:\OpenClaw)
 
-- PENDING 01ee3f9c7077 fix(plugins): resolve junction ancestors to the native root before fs-safe admission.
+- LATER 01ee3f9c7077 fix(plugins): resolve junction ancestors to the native root before fs-safe admission.
   Why: every plugin under <stateDir>\npm\projects failed "resolved path escapes plugin package directory" when the
   state dir was reached through the junction. Upstream has since shipped its own junction/realpath work
   (45f50f25, feccbe07, #185917): re-check whether this is still needed before porting.
-- PENDING d6c17860bebc fix(plugins): key plugin captures by native realpath and case-fold lookups on win32.
+- LATER d6c17860bebc fix(plugins): key plugin captures by native realpath and case-fold lookups on win32.
   Why: whatsapp/sms/signalwire-sms failed "Bundled companion is outside the plugin's captured module graph"
   because realpathSync (junction spelling "C:\openclaw") and realpathSync.native ("C:\OpenClaw") disagreed.
-- PENDING aa139c729329 fix(plugins): tolerate dangling dependency junctions during capture.
+- LATER aa139c729329 fix(plugins): tolerate dangling dependency junctions during capture.
   Why: existsSync follows a dangling junction -> EEXIST on the second link -> codex/whatsapp doctor contracts
   failed to load -> doctor --fix refused the plugin state migration (2026-10-20). lstat the link instead.
 
@@ -47,11 +48,14 @@ Legend: PENDING = not yet ported. PORTED <sha> = on this branch. DROPPED = decid
 
 ### TUI feature (fork-only; no upstream equivalent)
 
-- PENDING 4257d441e337 + 62f70ef8604f feat(tui): terminal window title follows the session name (/name foo).
+- LATER 4257d441e337 + 62f70ef8604f feat(tui): terminal window title follows the session name (/name foo).
+  Tried 2026-11-24: module and its 17 tests port as-is, but the one-line hook has no legal home. tui.ts (1532 counted
+  lines) and tui-event-handlers.ts (exactly 700) are both frozen by the line-cap ratchet, which rejects any growth.
+  Landing it means extracting the 120-line sessions.changed handler into a sibling module first. Deferred, Shannon to decide.
 
 ### Browser extension (MV3 reconnects)
 
-- PENDING 9d28bd349322 + 12026b0234d5 fix(browser): stabilize extension transport across MV3 reconnects
+- LATER 9d28bd349322 + 12026b0234d5 fix(browser): stabilize extension transport across MV3 reconnects
   (re-attach shared tabs on resync, keep the alias map on empty snapshots, createTab window fallback).
   Note: original commit says validation was still pending.
 
@@ -62,6 +66,14 @@ Legend: PENDING = not yet ported. PORTED <sha> = on this branch. DROPPED = decid
   team-reports, workboard) already passes an explicit 5000; only tests omit it. The default is never reached
   at runtime, so this patch does not change gateway behaviour and does not touch the pinned-reader WAL growth.
   Applies cleanly, but DROP unless a real caller with the option omitted is found.
+
+## Nice-to-Have-maybe-Later (Shannon 2026-11-24)
+
+- 01ee3f9c7077 junction ancestors (plugins) - d6c17860bebc native-realpath capture keys (plugins)
+- aa139c729329 dangling dependency junctions - 9d28bd349322 + 12026b0234d5 browser MV3 reconnects
+- 4257d441e337 + 62f70ef8604f TUI window title (blocked by the line-cap ratchet on two frozen files, see above)
+  All four are tagged LATER above with their reasons. The three plugin ones may already be covered by upstream's own
+  Windows junction work (45f50f25, feccbe07, #185917); test on the new build before porting.
 
 ## New on this branch
 
