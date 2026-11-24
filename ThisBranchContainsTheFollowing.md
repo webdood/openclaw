@@ -27,16 +27,22 @@ Legend: PENDING = not yet ported. PORTED <sha> = on this branch. DROPPED = decid
 
 ### Windows runtime fixes
 
-- PENDING d7a27d56864f fix(agents): locate Claude CLI transcripts under CLAUDE_CONFIG_DIR, key by observed cwd on win32.
+- DROPPED d7a27d56864f fix(agents): locate Claude CLI transcripts under CLAUDE_CONFIG_DIR, key by observed cwd on win32.
   Why: with CLAUDE_CONFIG_DIR set and the junctioned state dir, every transcript probe missed, sessions were
   invalidated "missing-transcript" and each turn started a fresh Claude session.
-- PENDING 8a0d588f2e36 fix(sessions): post a plain env copy to the session history worker on win32.
+  Decision 2026-11-24: upstream now honours CLAUDE_CONFIG_DIR itself; the win32 realpath half is a no-op here
+  because C:\OpenClaw\workspace and its native realpath are spelled identically. Re-port if "missing-transcript" returns.
+- DROPPED 8a0d588f2e36 fix(sessions): post a plain env copy to the session history worker on win32.
   Why: the case-insensitive env Proxy cannot be structured-cloned -> DataCloneError -> every webchat turn died.
+  Decision 2026-11-24: already upstream since a181c3f1 (2026-09-29): the reader boundary copies env into a plain object
+  and every worker request env goes through captureSessionTranscriptStorageEnvironment.
 
 ### Operability
 
-- PENDING 493f8031d151 doctor: say that database snapshots are in progress before going quiet.
+- PORTED 493f8031d151 doctor: say that database snapshots are in progress before going quiet.
   Why: doctor printed nothing for ~7 min during snapshots and kept getting killed as "hung".
+  Re-ported 2026-11-24 by hand (doctor was restructured upstream): notices now sit before
+  withOpenClawStateDatabaseReadSnapshot in doctor-lint-runner.ts and before the schema readers in doctor-database-preflight.ts.
 - PORTED 90ad4c409369 build: source maps on by default (opt-out with OUTPUT_SOURCE_MAPS=0). Cherry-picked 2026-11-24, clean.
 
 ### TUI feature (fork-only; no upstream equivalent)

@@ -96,6 +96,13 @@ export async function prepareDoctorDatabasePreflight(
     await readConfigSnapshotForEngineSelection();
   }
   const { scope, preserveSourceArtifacts } = options;
+  // The schema readers copy every database file into a private snapshot and wait for
+  // the copy to stop changing, which can take minutes while a Gateway keeps writing.
+  // Say so before going quiet, so a long wait is not mistaken for a hang.
+  process.stderr.write(
+    "doctor: reading database schemas through private snapshots " +
+      "(copies each database and waits for it to stop changing; this can take minutes while the Gateway runs)\n",
+  );
   const databasePreflight = await import("../state/openclaw-database-preflight.js");
   const [
     { createConfigIO },
